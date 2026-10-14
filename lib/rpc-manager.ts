@@ -218,6 +218,15 @@ function appendSlashCommand(
 export const BROWSER_NATIVE_SLASH_COMMANDS = ["fork", "goal"] as const;
 
 /**
+ * Registry metadata that does not describe the browser handler. omp 18.10 gave
+ * /fork pane/window/tab subcommands that open the fork in a terminal
+ * multiplexer; the browser fork ignores them, so it keeps its own description.
+ */
+const BROWSER_NATIVE_DESCRIPTIONS: Partial<Record<(typeof BROWSER_NATIVE_SLASH_COMMANDS)[number], string>> = {
+  fork: "Create a new fork from a previous message",
+};
+
+/**
  * Keep the browser palette aligned with omp's own command registry and
  * discovery pipeline. Shared text/ACP builtins and every discovered
  * extension/custom/MCP/file/skill command come from the SDK discovery;
@@ -237,14 +246,17 @@ export async function getAvailableSlashCommands(session: AgentSessionLike): Prom
   for (const name of BROWSER_NATIVE_SLASH_COMMANDS) {
     const builtin = BUILTIN_SLASH_COMMAND_DEFS.find((def) => def.name === name);
     if (!builtin) continue;
+    const browserDescription = BROWSER_NATIVE_DESCRIPTIONS[name];
     const hint = builtin.inlineHint;
+    // A browser-specific description means the registry's subcommands don't apply.
+    const subcommands = browserDescription ? undefined : builtin.subcommands;
     appendSlashCommand(commands, seenNames, {
       name: builtin.name,
       aliases: builtin.aliases,
-      description: builtin.description,
+      description: browserDescription ?? builtin.description,
       source: "builtin",
       ...(hint ? { input: { hint } } : {}),
-      ...(builtin.subcommands ? { subcommands: builtin.subcommands } : {}),
+      ...(subcommands ? { subcommands } : {}),
     });
   }
 
@@ -427,7 +439,10 @@ export class AgentSessionWrapper {
         error instanceof Error ? error.message : error,
       );
     });
-    this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
+    this.unsubscribe = this.inner.subscribe((sessionEvent) => {
+      // SDK event members are closed interfaces; the browser stream treats them
+      // as open records (omp 18.10's cache_warming_* events made that explicit).
+      const event = sessionEvent as unknown as AgentEvent;
       if (event.type === "agent_end") {
         invalidateSessionListCache();
       }
