@@ -190,6 +190,8 @@ export function AppShell() {
   const autoNameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
   activeSessionIdRef.current = selectedSession?.id ?? null;
+  const activeRuntimeIdRef = useRef(selectedSession?.runtimeId);
+  activeRuntimeIdRef.current = selectedSession?.runtimeId;
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
@@ -624,20 +626,27 @@ export function AppShell() {
     setExplorerRefreshKey((k) => k + 1);
   }, []);
 
-  const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string) => {
+  const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string | null) => {
     invalidateWorkspaceRestore();
     setRefreshKey((k) => k + 1);
-    if (!runtimeId) setSessionKey((k) => k + 1);
+    if (runtimeId === undefined) setSessionKey((k) => k + 1);
     setNewSessionCwd(null);
     setSelectedSession((prev) => ({
       ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
       id: newSessionId,
-      runtimeId,
+      runtimeId: runtimeId ?? undefined,
       transient: false,
     }));
     hydrateSelectedSession(newSessionId);
     router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
   }, [invalidateWorkspaceRestore, router, hydrateSelectedSession]);
+
+  const handleRuntimeExpired = useCallback((sessionId: string, expiredRuntimeId: string) => {
+    if (activeRuntimeIdRef.current !== expiredRuntimeId) return;
+    activeRuntimeIdRef.current = undefined;
+    if (activeSessionIdRef.current) chatInputRef.current?.rekeyDraft(activeSessionIdRef.current, sessionId);
+    handleSessionForked(sessionId, null);
+  }, [handleSessionForked]);
 
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
@@ -1710,6 +1719,8 @@ export function AppShell() {
             <div className="subagent-column">
               <SubagentPanel
                 sessionId={selectedSession?.id ?? null}
+                runtimeId={selectedSession?.runtimeId}
+                onRuntimeExpired={handleRuntimeExpired}
                 cwd={selectedSession?.cwd ?? effectiveNewSessionCwd ?? undefined}
                 subagents={subagents}
               />
@@ -1819,6 +1830,7 @@ export function AppShell() {
         cwd={projectTrustCwd}
         sessionId={selectedSession?.id ?? null}
         runtimeId={selectedSession?.runtimeId}
+        onRuntimeExpired={handleRuntimeExpired}
         onClose={() => setSettingsConfigOpen(false)}
         onModelsChanged={() => setModelsRefreshKey((key) => key + 1)}
         onReloaded={() => setSessionKey((key) => key + 1)}

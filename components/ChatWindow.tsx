@@ -44,7 +44,7 @@ interface Props {
   onAgentEnd?: (sessionId?: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
   onSessionCreated?: (session: SessionInfo) => void;
-  onSessionForked?: (newSessionId: string, runtimeId?: string) => void;
+  onSessionForked?: (newSessionId: string, runtimeId?: string | null) => void;
   modelsRefreshKey?: number;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;

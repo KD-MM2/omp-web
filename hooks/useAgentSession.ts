@@ -174,7 +174,7 @@ export interface UseAgentSessionOptions {
   onAgentEnd?: (sessionId?: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
   onSessionCreated?: (session: SessionInfo) => void;
-  onSessionForked?: (newSessionId: string, runtimeId?: string) => void;
+  onSessionForked?: (newSessionId: string, runtimeId?: string | null) => void;
   modelsRefreshKey?: number;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
@@ -431,9 +431,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const identityDraftKeyRef = useRef<string | undefined>(undefined);
   useLayoutEffect(() => {
     mountedRef.current = true;
+    if (session) {
+      sessionIdRef.current = session.id;
+      runtimeIdRef.current = session.runtimeId ?? null;
+    }
     identityDraftKeyRef.current = session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined);
     return () => { mountedRef.current = false; };
-  }, [session?.id, newSessionCwd]);
+  }, [session?.id, session?.runtimeId, newSessionCwd]);
   const agentRunningRef = useRef(false);
   const sdkAgentActiveRef = useRef(false);
   const rpcPromptPendingRef = useRef(false);
@@ -508,13 +512,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
-  const followSessionIdentity = useCallback((nextId: string, runtimeId?: string) => {
+  const followSessionIdentity = useCallback((nextId: string, runtimeId?: string | null) => {
     if (!mountedRef.current) return;
-    const handleChanged = Boolean(runtimeId && runtimeId !== runtimeIdRef.current);
-    if (runtimeId) runtimeIdRef.current = runtimeId;
+    const previousRuntimeId = runtimeIdRef.current;
+    const handleChanged = runtimeId !== undefined && runtimeId !== previousRuntimeId;
+    if (runtimeId !== undefined) runtimeIdRef.current = runtimeId;
+    if (runtimeId === null && previousRuntimeId) clearSessionContinuation(undefined, previousRuntimeId);
     if (runtimeIdRef.current) rememberSessionContinuation(nextId, runtimeIdRef.current);
     if (nextId === sessionIdRef.current) {
-      if (handleChanged) onSessionForked?.(nextId, runtimeId);
+      if (handleChanged || runtimeId === null) onSessionForked?.(nextId, runtimeId);
       return;
     }
     // Async sends awaiting the SSE handshake must use the new ID immediately;
@@ -525,20 +531,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     identityDraftKeyRef.current = nextId;
     sessionIdRef.current = nextId;
     eventSourceSessionIdRef.current = nextId;
-    onSessionForked?.(nextId, runtimeIdRef.current ?? undefined);
+    onSessionForked?.(nextId, runtimeId === null ? null : runtimeIdRef.current ?? undefined);
   }, [onSessionForked, opts.chatInputRef]);
 
-  runtimeIdRef.onSessionId = (id) => followSessionIdentity(id);
+  runtimeIdRef.onSessionId = (id) => followSessionIdentity(id, null);
 
   const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
     if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
     if (state?.sessionId) {
-      const expiredRuntimeId = !state.runtimeId ? runtimeIdRef.current : null;
-      followSessionIdentity(state.sessionId, state.runtimeId);
-      if (expiredRuntimeId) {
-        clearSessionContinuation(undefined, expiredRuntimeId);
-        runtimeIdRef.current = null;
-      }
+      followSessionIdentity(state.sessionId, state.runtimeId ?? null);
     }
     return false;
   }, [followSessionIdentity]);

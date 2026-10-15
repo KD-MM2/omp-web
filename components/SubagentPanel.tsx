@@ -70,11 +70,15 @@ function subagentActivity(subagent: SubagentSnapshot, t: (key: string, params?: 
 
 function SubagentDetail({
   sessionId,
+  runtimeId,
+  onRuntimeExpired,
   cwd,
   subagent,
   onBack,
 }: {
   sessionId: string;
+  runtimeId?: string;
+  onRuntimeExpired?: (sessionId: string, expiredRuntimeId: string) => void;
   cwd?: string;
   subagent: SubagentSnapshot;
   onBack: () => void;
@@ -104,7 +108,9 @@ function SubagentDetail({
           type: "get_subagent_messages",
           subagentId: subagent.id,
           fromByte: nextByte,
-        });
+        }, { current: runtimeId ?? null, onSessionId: (id, expiredId) => {
+          if (!disposed) onRuntimeExpired?.(id, expiredId);
+        } });
         if (disposed) return;
         const chunk = result.entries.flatMap((entry, index) =>
           entry.type === "message" && entry.message
@@ -130,7 +136,7 @@ function SubagentDetail({
       disposed = true;
       clearInterval(interval);
     };
-  }, [active, sessionId, subagent.id]);
+  }, [active, sessionId, runtimeId, onRuntimeExpired, subagent.id]);
 
   useEffect(() => {
     if (!followTailRef.current) return;
@@ -269,7 +275,7 @@ function SubagentRow({ subagent, selected, onSelect }: { subagent: SubagentSnaps
   );
 }
 
-export function SubagentPanel({ sessionId, cwd, subagents }: { sessionId: string | null; cwd?: string; subagents: SubagentSnapshot[] }) {
+export function SubagentPanel({ sessionId, runtimeId, onRuntimeExpired, cwd, subagents }: { sessionId: string | null; runtimeId?: string; onRuntimeExpired?: (sessionId: string, expiredRuntimeId: string) => void; cwd?: string; subagents: SubagentSnapshot[] }) {
   const { t } = useI18n();
   const [collapsed, setCollapsed] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -305,7 +311,7 @@ export function SubagentPanel({ sessionId, cwd, subagents }: { sessionId: string
       }}
     >
       {selected ? (
-        <SubagentDetail sessionId={sessionId} cwd={cwd} subagent={selected} onBack={() => setSelectedId(null)} />
+        <SubagentDetail sessionId={sessionId} runtimeId={runtimeId} onRuntimeExpired={onRuntimeExpired} cwd={cwd} subagent={selected} onBack={() => setSelectedId(null)} />
       ) : (
         <>
           <button

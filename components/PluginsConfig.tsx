@@ -616,6 +616,7 @@ export function PluginsConfig({
   cwd,
   sessionId,
   runtimeId,
+  onRuntimeExpired,
   onClose,
   onReloaded,
   embedded = false,
@@ -623,6 +624,7 @@ export function PluginsConfig({
   cwd: string;
   sessionId: string | null;
   runtimeId?: string;
+  onRuntimeExpired?: (sessionId: string, expiredRuntimeId: string) => void;
   onClose: () => void;
   onReloaded?: () => void;
   embedded?: boolean;
@@ -743,7 +745,7 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     try {
-      await sendAgentCommand(sessionId, { type: "reload" }, { current: runtimeId ?? null });
+      await sendAgentCommand(sessionId, { type: "reload" }, { current: runtimeId ?? null, onSessionId: onRuntimeExpired });
       onReloaded?.();
       await loadPlugins();
       setActionMessage("Session reloaded.");
@@ -752,7 +754,7 @@ export function PluginsConfig({
     } finally {
       setBusyKey(null);
     }
-  }, [loadPlugins, onReloaded, runtimeId, sessionId]);
+  }, [loadPlugins, onReloaded, onRuntimeExpired, runtimeId, sessionId]);
 
   const addBusy = busyKey?.startsWith("install:") ?? false;
 
