@@ -425,7 +425,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceGenerationRef = useRef(0);
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
-  const runtimeIdRef = useRef<string | null>(session?.runtimeId ?? null);
+  const runtimeIdRef: { current: string | null; onSessionId?: (id: string) => void } = useRef(session?.runtimeId ?? null);
   const mountedRef = useRef(false);
   const identityDraftKeyRef = useRef<string | undefined>(undefined);
   useLayoutEffect(() => {
@@ -522,12 +522,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     onSessionForked?.(nextId, runtimeIdRef.current ?? undefined);
   }, [onSessionForked, opts.chatInputRef]);
 
+  runtimeIdRef.onSessionId = (id) => followSessionIdentity(id);
+
   const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
     if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
     if (state?.runtimeId) runtimeIdRef.current = state.runtimeId;
     if (state?.sessionId && state.sessionId !== requestedId) {
       followSessionIdentity(state.sessionId, state.runtimeId);
-      return true;
     }
     return false;
   }, [followSessionIdentity]);
@@ -577,8 +578,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (!mountedRef.current || sessionIdRef.current !== sid) return null;
 
         const liveState = agentState.state;
-        if (!agentState.running) runtimeIdRef.current = null;
         if (followRuntimeState(liveState, sid)) return agentState;
+        if (!agentState.running && liveState?.sessionId) runtimeIdRef.current = null;
         if (liveState) {
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
           if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
@@ -814,8 +815,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const stateRes = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current)}`);
       if (stateRes.ok) {
         const state = await stateRes.json() as { running?: boolean; state?: AgentStateResponse };
-        if (!state.running) runtimeIdRef.current = null;
-        else followRuntimeState(state.state, sid);
+        if (followRuntimeState(state.state, sid)) throw new Error("Session is no longer active");
+        if (!state.running) {
+          if (!state.state?.sessionId) throw new Error("Runtime identity expired; reopen the intended session");
+          runtimeIdRef.current = null;
+        }
+        sid = sessionIdRef.current ?? sid;
       }
     }
     const current = eventSourceRef.current;
@@ -989,6 +994,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
         const state = data.state;
         if (followRuntimeState(state, sid)) return;
+        sid = sessionIdRef.current ?? sid;
         setSubagents((current) => mergeSubagentSnapshots(current, state?.subagents ?? []));
         const promptActive = Boolean(
           data.running
@@ -1040,11 +1046,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId = promptRunIdRef.current) => {
     // Bail out before loadSession too: a stale finish for a previous run
     // must not overwrite the messages of the run currently streaming.
-    if (promptRunIdRef.current !== runId) return;
+    if (!mountedRef.current || promptRunIdRef.current !== runId) return;
+    sid = sessionIdRef.current ?? sid;
     try {
       if (sid) await loadSession(sid);
     } finally {
-      if (promptRunIdRef.current !== runId) return;
+      if (!mountedRef.current || promptRunIdRef.current !== runId) return;
       const promptWasPending = rpcPromptPendingRef.current;
       const agentWasActive = sdkAgentActiveRef.current;
       rpcPromptPendingRef.current = false;
@@ -1072,6 +1079,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
           const state = data.state;
           if (followRuntimeState(state, sid)) return;
+          sid = sessionIdRef.current ?? sid;
           if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
             await finishPromptWithoutStream(sid, runId);
             return;
@@ -1099,6 +1107,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (!res.ok) continue;
         const data = await res.json() as { state?: AgentStateResponse };
         if (followRuntimeState(data.state, sid)) return;
+        sid = sessionIdRef.current ?? sid;
         if (data.state?.isBashRunning) continue;
 
         await loadSession(sid);
@@ -1131,6 +1140,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (promptRunIdRef.current !== runId) return;
       const state = data.state;
       if (followRuntimeState(state, sid)) return;
+      sid = sessionIdRef.current ?? sid;
       // Mirror compaction state unconditionally: a missed compaction_end
       // would otherwise leave the "Stop compaction" UI stuck. No state
       // (wrapper destroyed) means nothing is compacting.
@@ -1605,7 +1615,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       opts.chatInputRef?.current?.restoreSubmission?.(
         message,
         images?.map(({ data, mimeType }) => ({ data, mimeType })),
-        session?.id ?? sentSessionId ?? undefined,
+        sessionIdRef.current ?? sentSessionId ?? session?.id ?? undefined,
       );
       optimisticUserMessageKeyRef.current = null;
       setAgentRunning(false);
@@ -2157,6 +2167,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAutoFollow(false);
     }
   }, [setAutoFollow]);
+
+  const displayedSessionIdRef = useRef(session?.id);
+  useEffect(() => {
+    if (session?.id && session.id !== displayedSessionIdRef.current) {
+      displayedSessionIdRef.current = session.id;
+      void loadSession(session.id);
+    }
+  }, [session?.id, loadSession]);
 
   // Load session on mount
   useEffect(() => {

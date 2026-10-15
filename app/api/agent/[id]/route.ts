@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
-import { startRpcSession, getRpcSession } from "@/lib/rpc-manager";
+import { startRpcSession, getRpcSession, getFinalRpcSessionId } from "@/lib/rpc-manager";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 
 // POST /api/agent/[id] - Send a command to an existing session
@@ -34,6 +34,7 @@ export async function POST(
     if (id.startsWith("runtime:")) {
       return NextResponse.json({
         error: "Runtime session expired", code: "runtime_expired", accepted: false,
+        sessionId: getFinalRpcSessionId(id),
       }, { status: 404 });
     }
 
@@ -72,7 +73,8 @@ export async function GET(
   try {
     const session = getRpcSession(id);
     if (!session || !session.isAlive()) {
-      return NextResponse.json({ running: false });
+      const sessionId = getFinalRpcSessionId(id);
+      return NextResponse.json({ running: false, ...(sessionId ? { state: { sessionId } } : {}) });
     }
 
     const state = await session.send({ type: "get_state" });

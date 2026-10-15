@@ -21,14 +21,14 @@ export class AgentCommandError extends Error {
 
 export function isPromptRejectedError(error: unknown): error is AgentCommandError {
   return error instanceof AgentCommandError
-    && error.code === "prompt_rejected"
+    && (error.code === "prompt_rejected" || error.code === "runtime_expired")
     && error.accepted === false;
 }
 
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
-  runtime?: { current: string | null },
+  runtime?: { current: string | null; onSessionId?: (id: string) => void },
 ): Promise<T> {
   const runtimeId = runtime?.current;
   const res = await fetch(`/api/agent/${encodeURIComponent(runtimeId ?? sessionId)}`, {
@@ -42,13 +42,15 @@ export async function sendAgentCommand<T = unknown>(
     error?: string;
     code?: string;
     accepted?: boolean;
+    sessionId?: string;
   };
   if (!res.ok || body.error) {
     // Retry only when the server guarantees that the expired handle executed nothing.
     if (runtimeId && runtime?.current === runtimeId && res.status === 404
-      && body.code === "runtime_expired" && body.accepted === false) {
+      && body.code === "runtime_expired" && body.accepted === false && body.sessionId) {
+      runtime.onSessionId?.(body.sessionId);
       runtime.current = null;
-      return sendAgentCommand<T>(sessionId, command);
+      return sendAgentCommand<T>(body.sessionId, command);
     }
     throw new AgentCommandError(
       body.error ?? `HTTP ${res.status}`,

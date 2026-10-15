@@ -624,7 +624,7 @@ export function AppShell() {
   const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string) => {
     invalidateWorkspaceRestore();
     setRefreshKey((k) => k + 1);
-    setSessionKey((k) => k + 1);
+    if (!runtimeId) setSessionKey((k) => k + 1);
     setNewSessionCwd(null);
     setSelectedSession((prev) => ({
       ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),

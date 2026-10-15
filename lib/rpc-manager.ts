@@ -1195,6 +1195,10 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    const finalIds = globalThis.__ompFinalSessionIds ??= new Map<string, string>();
+    finalIds.set(this.runtimeId, this.sessionId);
+    // A bounded continuation record, never a historical-session alias.
+    while (finalIds.size > 1024) finalIds.delete(finalIds.keys().next().value!);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
@@ -1571,6 +1575,7 @@ export class AgentSessionWrapper {
 
 declare global {
   var __ompSessions: Map<string, AgentSessionWrapper> | undefined;
+  var __ompFinalSessionIds: Map<string, string> | undefined;
   var __ompStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompStartingSessionCwds: Map<string, number> | undefined;
   var __ompRunningListeners: Set<(ids: string[]) => void> | undefined;
@@ -1615,6 +1620,10 @@ function trackStartingSession(cwd: string): () => void {
     if (remaining > 0) startingCwds.set(key, remaining);
     else startingCwds.delete(key);
   };
+}
+
+export function getFinalRpcSessionId(runtimeId: string): string | undefined {
+  return globalThis.__ompFinalSessionIds?.get(runtimeId);
 }
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
