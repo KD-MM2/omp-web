@@ -26,6 +26,7 @@ type SettingsSection = "models" | "themes" | "skills" | "plugins" | "mcp" | "acc
 interface SettingsConfigProps {
   cwd?: string | null;
   sessionId: string | null;
+  runtimeId?: string;
   initialSection?: SettingsSection;
   onClose: () => void;
   onModelsChanged?: () => void;
@@ -187,7 +188,7 @@ function ThemePreview({ palette }: { palette: WebThemePalette }) {
 /** Settings the web client applies itself, without reloading the agent. */
 const DISPLAY_SETTING_PATHS = new Set(["hideThinkingBlock"]);
 
-export function SettingsConfig({ cwd, sessionId, initialSection = "models", onClose, onModelsChanged, onReloaded }: SettingsConfigProps) {
+export function SettingsConfig({ cwd, sessionId, runtimeId, initialSection = "models", onClose, onModelsChanged, onReloaded }: SettingsConfigProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -257,7 +258,7 @@ export function SettingsConfig({ cwd, sessionId, initialSection = "models", onCl
     if (!sessionId) return;
     setReloading(true);
     try {
-      await sendAgentCommand(sessionId, { type: "reload" });
+      await sendAgentCommand(sessionId, { type: "reload" }, { current: runtimeId ?? null });
       setNeedsReload(false);
       onReloaded?.();
     } catch (error) {
@@ -265,7 +266,7 @@ export function SettingsConfig({ cwd, sessionId, initialSection = "models", onCl
     } finally {
       setReloading(false);
     }
-  }, [onReloaded, sessionId]);
+  }, [onReloaded, runtimeId, sessionId]);
   const selectedTab = settings?.tabs.find((tab) => tab.id === activeTab);
   const pageTitle = query.trim() ? `Search · ${filteredFields.length}` : selectedTab?.label ?? "Settings";
 
@@ -340,14 +341,14 @@ export function SettingsConfig({ cwd, sessionId, initialSection = "models", onCl
           <div className={styles.closeRail}><button type="button" className={styles.closeButton} onClick={close}><span>Close settings</span><span aria-hidden="true">×</span></button></div>
         </aside>
         <main className={styles.content}>
-          {query.trim() ? renderGenericSettings() : section === "models" ? <ModelsConfig cwd={cwd} embedded onClose={close} onModelsChanged={onModelsChanged} /> : section === "themes" ? renderThemeSection() : section === "skills" && cwd ? <SkillsConfig cwd={cwd} embedded onClose={close} /> : section === "plugins" && cwd ? <PluginsConfig cwd={cwd} sessionId={sessionId} embedded onClose={close} onReloaded={onReloaded} /> : section === "mcp" ? <McpSettings cwd={cwd} sessionId={sessionId} onReloaded={onReloaded} /> : section === "access" ? <AccessConfig /> : renderGenericSettings()}
+          {query.trim() ? renderGenericSettings() : section === "models" ? <ModelsConfig cwd={cwd} embedded onClose={close} onModelsChanged={onModelsChanged} /> : section === "themes" ? renderThemeSection() : section === "skills" && cwd ? <SkillsConfig cwd={cwd} embedded onClose={close} /> : section === "plugins" && cwd ? <PluginsConfig cwd={cwd} sessionId={sessionId} runtimeId={runtimeId} embedded onClose={close} onReloaded={onReloaded} /> : section === "mcp" ? <McpSettings cwd={cwd} sessionId={sessionId} runtimeId={runtimeId} onReloaded={onReloaded} /> : section === "access" ? <AccessConfig /> : renderGenericSettings()}
         </main>
       </div>
     </div>
   );
 }
 
-function McpSettings({ cwd, sessionId, onReloaded }: { cwd?: string | null; sessionId?: string | null; onReloaded?: () => void }) {
+function McpSettings({ cwd, sessionId, runtimeId, onReloaded }: { cwd?: string | null; sessionId?: string | null; runtimeId?: string; onReloaded?: () => void }) {
   const [data, setData] = useState<McpConfigResponse | null>(null);
   const [scope, setScope] = useState<"user" | "project">("user");
   const [selected, setSelected] = useState(0);
@@ -423,7 +424,7 @@ function McpSettings({ cwd, sessionId, onReloaded }: { cwd?: string | null; sess
       if (!response.ok || result.error) throw new Error(result.error ?? `HTTP ${response.status}`);
       await load();
       if (sessionId) {
-        await sendAgentCommand(sessionId, { type: "reload" });
+        await sendAgentCommand(sessionId, { type: "reload" }, { current: runtimeId ?? null });
         onReloaded?.();
       }
     } catch (caught) {

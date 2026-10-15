@@ -615,12 +615,14 @@ function PackageDetail({
 export function PluginsConfig({
   cwd,
   sessionId,
+  runtimeId,
   onClose,
   onReloaded,
   embedded = false,
 }: {
   cwd: string;
   sessionId: string | null;
+  runtimeId?: string;
   onClose: () => void;
   onReloaded?: () => void;
   embedded?: boolean;
@@ -741,7 +743,7 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     try {
-      await sendAgentCommand(sessionId, { type: "reload" });
+      await sendAgentCommand(sessionId, { type: "reload" }, { current: runtimeId ?? null });
       onReloaded?.();
       await loadPlugins();
       setActionMessage("Session reloaded.");
@@ -750,7 +752,7 @@ export function PluginsConfig({
     } finally {
       setBusyKey(null);
     }
-  }, [loadPlugins, onReloaded, sessionId]);
+  }, [loadPlugins, onReloaded, runtimeId, sessionId]);
 
   const addBusy = busyKey?.startsWith("install:") ?? false;
 

@@ -170,7 +170,7 @@ export type BuiltinSlashCommandResult =
 export interface UseAgentSessionOptions {
   session: SessionInfo | null;
   newSessionCwd: string | null;
-  onAgentEnd?: () => void;
+  onAgentEnd?: (sessionId?: string) => void;
   onAttentionNeeded?: (request: BlockingExtensionUiRequest) => void;
   onSessionCreated?: (session: SessionInfo) => void;
   onSessionForked?: (newSessionId: string, runtimeId?: string) => void;
@@ -509,10 +509,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const followSessionIdentity = useCallback((nextId: string, runtimeId?: string) => {
     if (!mountedRef.current) return;
+    const handleChanged = Boolean(runtimeId && runtimeId !== runtimeIdRef.current);
     if (runtimeId) runtimeIdRef.current = runtimeId;
-    if (nextId === sessionIdRef.current) return;
+    if (nextId === sessionIdRef.current) {
+      if (handleChanged) onSessionForked?.(nextId, runtimeId);
+      return;
+    }
     // Async sends awaiting the SSE handshake must use the new ID immediately;
-    // waiting for the parent to remount leaves captured IDs pointing at history.
+    // React state alone leaves pending callbacks pointing at historical IDs.
     if (identityDraftKeyRef.current) {
       opts.chatInputRef?.current?.rekeyDraft?.(identityDraftKeyRef.current, nextId);
     }
@@ -526,8 +530,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
     if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
-    if (state?.runtimeId) runtimeIdRef.current = state.runtimeId;
-    if (state?.sessionId && state.sessionId !== requestedId) {
+    if (state?.sessionId) {
       followSessionIdentity(state.sessionId, state.runtimeId);
     }
     return false;
@@ -966,7 +969,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const notifyPromptStage = useCallback((runId: number) => {
     if (notifiedPromptRunIdRef.current === runId) return false;
     notifiedPromptRunIdRef.current = runId;
-    onAgentEnd?.();
+    onAgentEnd?.(sessionIdRef.current ?? undefined);
     return true;
   }, [onAgentEnd]);
 
@@ -1061,7 +1064,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (promptWasPending) {
         notifyPromptStage(runId);
       } else if (agentWasActive && wasRunning) {
-        onAgentEnd?.();
+        onAgentEnd?.(sessionIdRef.current ?? undefined);
       }
       if (sid) scheduleEventStreamClose(sid);
     }
@@ -1285,7 +1288,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           void loadSession(sid);
           scheduleEventStreamClose(sid);
         }
-        if (wasRunning) onAgentEnd?.();
+        if (wasRunning) onAgentEnd?.(sessionIdRef.current ?? undefined);
         break;
       }
       case "prompt_done":

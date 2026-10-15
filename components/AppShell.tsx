@@ -553,13 +553,15 @@ export function AppShell() {
     }
   }, [handleSelectSession]);
 
-  const handleAgentEnd = useCallback(() => {
+  const handleAgentEnd = useCallback((completedSessionId?: string) => {
     setRefreshKey((k) => k + 1);
     setExplorerRefreshKey((k) => k + 1);
-    if (selectedSession) hydrateSelectedSession(selectedSession.id);
+    const targetSession = selectedSession
+      ? { ...selectedSession, id: completedSessionId ?? selectedSession.id }
+      : null;
+    if (targetSession) hydrateSelectedSession(targetSession.id);
 
     if (!shouldShowBrowserNotification()) return;
-    const targetSession = selectedSession;
     deliverSessionNotification({
       targetSession,
       title: targetSession?.name ?? translate("i18n.sessionComplete"),
@@ -1815,6 +1817,7 @@ export function AppShell() {
       <SettingsConfig
         cwd={projectTrustCwd}
         sessionId={selectedSession?.id ?? null}
+        runtimeId={selectedSession?.runtimeId}
         onClose={() => setSettingsConfigOpen(false)}
         onModelsChanged={() => setModelsRefreshKey((key) => key + 1)}
         onReloaded={() => setSessionKey((key) => key + 1)}

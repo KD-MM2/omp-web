@@ -1726,7 +1726,7 @@ export async function destroyRpcSessionsForCwd(cwd: string): Promise<number> {
 // is attributed to its final transcript rather than its historical ID.
 export function getRpcSessionActivitySnapshot() {
   const runningSessionIds = new Set<string>();
-  const sessionIdsByRuntimeId: Record<string, string> = {};
+  const sessionIdsByRuntimeId: Record<string, string> = Object.fromEntries(globalThis.__ompFinalSessionIds ?? []);
   for (const session of getRegistry().values()) {
     if (!session.isAlive()) continue;
     sessionIdsByRuntimeId[session.runtimeId] = session.sessionId;
