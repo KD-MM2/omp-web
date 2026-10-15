@@ -27,7 +27,7 @@ import {
   showBrowserNotification,
 } from "@/lib/browser-notifications";
 import { getInitialNavigation } from "@/lib/initial-navigation";
-import { clearLastOpen, getLastOpenSession, setLastOpenSession } from "@/lib/workspace-memory";
+import { clearLastOpen, getLastOpenSession, setLastOpenSession, getSessionContinuation, clearSessionContinuation } from "@/lib/workspace-memory";
 import {
   getDefaultRightPanelWidth,
   getRightPanelMaxWidth,
@@ -374,7 +374,7 @@ export function AppShell() {
         // present: useAgentSession loads content in a mount-only effect, so
         // the null-session welcome mount from the switch would never load
         // the restored session's messages.
-        setSelectedSession(s);
+        setSelectedSession({ ...s, runtimeId: getSessionContinuation(s.id) });
         setSessionKey((k) => k + 1);
         if (new URLSearchParams(window.location.search).get("session") !== s.id) {
           router.replace(`?session=${encodeURIComponent(s.id)}`, { scroll: false });
@@ -453,7 +453,8 @@ export function AppShell() {
       }
     }
     setNewSessionCwd(null);
-    setSelectedSession({ ...session, runtimeId: undefined });
+    if (!isRestore) clearSessionContinuation();
+    setSelectedSession({ ...session, runtimeId: isRestore ? getSessionContinuation(session.id) : undefined });
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
     setInitialSessionRestored(true);
@@ -472,6 +473,7 @@ export function AppShell() {
   }, [invalidateWorkspaceRestore, router, isMobile, selectedSession]);
 
   const handleNewSession = useCallback((_sessionId: string, cwd: string) => {
+    clearSessionContinuation();
     invalidateWorkspaceRestore();
     setSelectedSession(null);
     setNewSessionCwd(cwd);

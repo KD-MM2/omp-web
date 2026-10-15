@@ -16,6 +16,7 @@ import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { stripAnsi } from "@/lib/ansi";
 import { isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
+import { rememberSessionContinuation } from "@/lib/workspace-memory";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import type { ContextUsage, GoalStatusInfo, SessionStatsInfo, SlashCommandInfo } from "@/lib/omp-types";
 import type { ModelRoleAssignment } from "@/lib/api-types";
@@ -511,6 +512,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!mountedRef.current) return;
     const handleChanged = Boolean(runtimeId && runtimeId !== runtimeIdRef.current);
     if (runtimeId) runtimeIdRef.current = runtimeId;
+    if (runtimeIdRef.current) rememberSessionContinuation(nextId, runtimeIdRef.current);
     if (nextId === sessionIdRef.current) {
       if (handleChanged) onSessionForked?.(nextId, runtimeId);
       return;
@@ -695,6 +697,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const realId = result.sessionId;
       sessionIdRef.current = realId;
       runtimeIdRef.current = result.runtimeId ?? null;
+      if (result.runtimeId) rememberSessionContinuation(realId, result.runtimeId);
       if (result.model && newSessionModelOverrideRef.current === selectedModel) {
         setPendingModel(result.model);
         if (!selectedModel) setNewSessionDefaultModel(result.model);
