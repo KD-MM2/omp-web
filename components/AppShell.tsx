@@ -18,6 +18,7 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useAudio } from "@/hooks/useAudio";
+import { canApplySessionIdentity, type SessionIdentity } from "@/lib/agent-client";
 import { copyText } from "@/lib/clipboard";
 import { getFileName } from "@/lib/file-paths";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
@@ -586,6 +587,34 @@ export function AppShell() {
     });
   }, [deliverSessionNotification, selectedSession, translate]);
 
+  const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string | null) => {
+    activeSessionIdRef.current = newSessionId;
+    activeRuntimeIdRef.current = runtimeId ?? undefined;
+    invalidateWorkspaceRestore();
+    setRefreshKey((k) => k + 1);
+    if (runtimeId === undefined) setSessionKey((k) => k + 1);
+    setNewSessionCwd(null);
+    setSelectedSession((prev) => ({
+      ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
+      id: newSessionId,
+      runtimeId: runtimeId ?? undefined,
+      transient: false,
+    }));
+    hydrateSelectedSession(newSessionId);
+    router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
+  }, [invalidateWorkspaceRestore, router, hydrateSelectedSession]);
+
+  const handleRuntimeIdentity = useCallback((identity: SessionIdentity, request: SessionIdentity) => {
+    const current = { sessionId: activeSessionIdRef.current ?? "", runtimeId: activeRuntimeIdRef.current ?? null };
+    if (!canApplySessionIdentity(current, identity, request)) return false;
+    if (current.sessionId === identity.sessionId && current.runtimeId === identity.runtimeId) return true;
+    chatInputRef.current?.rekeyDraft(current.sessionId, identity.sessionId);
+    if (identity.runtimeId) rememberSessionContinuation(identity.sessionId, identity.runtimeId);
+    else if (request.runtimeId) clearSessionContinuation(undefined, request.runtimeId);
+    handleSessionForked(identity.sessionId, identity.runtimeId);
+    return true;
+  }, [handleSessionForked]);
+
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
     const runtimeId = selectedSession?.runtimeId;
@@ -605,14 +634,13 @@ export function AppShell() {
 
       const title = body.title.trim();
       setRefreshKey((key) => key + 1);
-      if (runtimeId ? activeRuntimeIdRef.current !== runtimeId : activeSessionIdRef.current !== sessionId) return;
       const canonicalId = body.sessionId ?? sessionId;
-      if (activeSessionIdRef.current) chatInputRef.current?.rekeyDraft(activeSessionIdRef.current, canonicalId);
-      if (body.runtimeId) rememberSessionContinuation(canonicalId, body.runtimeId);
-      setSelectedSession((current) => current && (runtimeId ? current.runtimeId === runtimeId : current.id === sessionId)
-        ? { ...current, id: canonicalId, runtimeId: body.runtimeId, name: title } : current);
+      if (!handleRuntimeIdentity(
+        { sessionId: canonicalId, runtimeId: body.runtimeId ?? null },
+        { sessionId, runtimeId: runtimeId ?? null },
+      )) return;
+      setSelectedSession((current) => current?.id === canonicalId ? { ...current, name: title } : current);
       setSessionStats((current) => current ? { ...current, sessionId: canonicalId, sessionName: title } : current);
-      router.replace(`?session=${encodeURIComponent(canonicalId)}`, { scroll: false });
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
@@ -621,7 +649,7 @@ export function AppShell() {
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id, selectedSession?.runtimeId, router]);
+  }, [autoNameStatus.kind, selectedSession?.id, selectedSession?.runtimeId, handleRuntimeIdentity]);
 
   useEffect(() => {
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
@@ -631,28 +659,6 @@ export function AppShell() {
   const handleExplorerRefresh = useCallback(() => {
     setExplorerRefreshKey((k) => k + 1);
   }, []);
-
-  const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string | null) => {
-    invalidateWorkspaceRestore();
-    setRefreshKey((k) => k + 1);
-    if (runtimeId === undefined) setSessionKey((k) => k + 1);
-    setNewSessionCwd(null);
-    setSelectedSession((prev) => ({
-      ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
-      id: newSessionId,
-      runtimeId: runtimeId ?? undefined,
-      transient: false,
-    }));
-    hydrateSelectedSession(newSessionId);
-    router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
-  }, [invalidateWorkspaceRestore, router, hydrateSelectedSession]);
-
-  const handleRuntimeExpired = useCallback((sessionId: string, expiredRuntimeId: string) => {
-    if (activeRuntimeIdRef.current !== expiredRuntimeId) return;
-    activeRuntimeIdRef.current = undefined;
-    if (activeSessionIdRef.current) chatInputRef.current?.rekeyDraft(activeSessionIdRef.current, sessionId);
-    handleSessionForked(sessionId, null);
-  }, [handleSessionForked]);
 
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
@@ -1727,7 +1733,7 @@ export function AppShell() {
               <SubagentPanel
                 sessionId={selectedSession?.id ?? null}
                 runtimeId={selectedSession?.runtimeId}
-                onRuntimeExpired={handleRuntimeExpired}
+                onRuntimeIdentity={handleRuntimeIdentity}
                 cwd={selectedSession?.cwd ?? effectiveNewSessionCwd ?? undefined}
                 subagents={subagents}
               />
@@ -1837,10 +1843,15 @@ export function AppShell() {
         cwd={projectTrustCwd}
         sessionId={selectedSession?.id ?? null}
         runtimeId={selectedSession?.runtimeId}
-        onRuntimeExpired={handleRuntimeExpired}
+        onRuntimeIdentity={handleRuntimeIdentity}
         onClose={() => setSettingsConfigOpen(false)}
         onModelsChanged={() => setModelsRefreshKey((key) => key + 1)}
-        onReloaded={() => setSessionKey((key) => key + 1)}
+        onReloaded={(runtimeId) => {
+          const ownsSession = runtimeId
+            ? activeRuntimeIdRef.current === runtimeId
+            : activeSessionIdRef.current === selectedSession?.id && !activeRuntimeIdRef.current;
+          if (ownsSession) setSessionKey((key) => key + 1);
+        }}
       />
     )}
     {projectTrustDialogOpen && projectTrustCwd && (

@@ -28,7 +28,8 @@ export async function POST(
     if (existing?.isAlive()) {
       const result = await existing.send(body);
       promptAccepted = body.type === "prompt";
-      return NextResponse.json({ success: true, data: result });
+      existing.syncSessionIdentity();
+      return NextResponse.json({ success: true, data: result, sessionId: existing.sessionId, runtimeId: existing.runtimeId });
     }
 
     if (id.startsWith("runtime:")) {
@@ -52,7 +53,8 @@ export async function POST(
     const result = await session.send(body);
     promptAccepted = body.type === "prompt";
 
-    return NextResponse.json({ success: true, data: result });
+    session.syncSessionIdentity();
+    return NextResponse.json({ success: true, data: result, sessionId: session.sessionId, runtimeId: session.runtimeId });
   } catch (error) {
     return NextResponse.json({
       error: error instanceof Error ? error.message : String(error),

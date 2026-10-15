@@ -636,7 +636,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
     const completedInBackground = [...previous].flatMap((id) => {
       const runtimeId = previousRuntimeIds.get(id);
       const currentId = (runtimeId && activitySnapshot.sessionIdsByRuntimeId?.[runtimeId]) || id;
-      return !runningSessionIds.has(currentId) && id !== selectedSessionId && currentId !== selectedSessionId && currentId !== selectedCanonicalId
+      return !runningSessionIds.has(currentId) && currentId !== selectedCanonicalId
         ? [currentId] : [];
     });
     const newlyRunning = [...runningSessionIds].filter((id) => !previous.has(id));

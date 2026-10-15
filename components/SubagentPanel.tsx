@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentMessage, SubagentSnapshot, ToolResultMessage } from "@/lib/types";
 import { useI18n } from "@/hooks/useI18n";
 import { normalizeToolCalls } from "@/lib/normalize";
-import { sendAgentCommand } from "@/lib/agent-client";
+import { sendAgentCommand, type RuntimeSessionBinding } from "@/lib/agent-client";
 import { MessageView } from "./MessageView";
 
 type SubagentTranscriptEntry = {
@@ -71,14 +71,14 @@ function subagentActivity(subagent: SubagentSnapshot, t: (key: string, params?: 
 function SubagentDetail({
   sessionId,
   runtimeId,
-  onRuntimeExpired,
+  onRuntimeIdentity,
   cwd,
   subagent,
   onBack,
 }: {
   sessionId: string;
   runtimeId?: string;
-  onRuntimeExpired?: (sessionId: string, expiredRuntimeId: string) => void;
+  onRuntimeIdentity?: RuntimeSessionBinding["onIdentity"];
   cwd?: string;
   subagent: SubagentSnapshot;
   onBack: () => void;
@@ -108,8 +108,9 @@ function SubagentDetail({
           type: "get_subagent_messages",
           subagentId: subagent.id,
           fromByte: nextByte,
-        }, { current: runtimeId ?? null, onSessionId: (id, expiredId) => {
-          if (!disposed) onRuntimeExpired?.(id, expiredId);
+        }, { current: runtimeId ?? null, onIdentity: (identity, request) => {
+          if (disposed) return false;
+          return onRuntimeIdentity?.(identity, request);
         } });
         if (disposed) return;
         const chunk = result.entries.flatMap((entry, index) =>
@@ -136,7 +137,7 @@ function SubagentDetail({
       disposed = true;
       clearInterval(interval);
     };
-  }, [active, sessionId, runtimeId, onRuntimeExpired, subagent.id]);
+  }, [active, sessionId, runtimeId, onRuntimeIdentity, subagent.id]);
 
   useEffect(() => {
     if (!followTailRef.current) return;
@@ -275,7 +276,7 @@ function SubagentRow({ subagent, selected, onSelect }: { subagent: SubagentSnaps
   );
 }
 
-export function SubagentPanel({ sessionId, runtimeId, onRuntimeExpired, cwd, subagents }: { sessionId: string | null; runtimeId?: string; onRuntimeExpired?: (sessionId: string, expiredRuntimeId: string) => void; cwd?: string; subagents: SubagentSnapshot[] }) {
+export function SubagentPanel({ sessionId, runtimeId, onRuntimeIdentity, cwd, subagents }: { sessionId: string | null; runtimeId?: string; onRuntimeIdentity?: RuntimeSessionBinding["onIdentity"]; cwd?: string; subagents: SubagentSnapshot[] }) {
   const { t } = useI18n();
   const [collapsed, setCollapsed] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -311,7 +312,7 @@ export function SubagentPanel({ sessionId, runtimeId, onRuntimeExpired, cwd, sub
       }}
     >
       {selected ? (
-        <SubagentDetail sessionId={sessionId} runtimeId={runtimeId} onRuntimeExpired={onRuntimeExpired} cwd={cwd} subagent={selected} onBack={() => setSelectedId(null)} />
+        <SubagentDetail sessionId={sessionId} runtimeId={runtimeId} onRuntimeIdentity={onRuntimeIdentity} cwd={cwd} subagent={selected} onBack={() => setSelectedId(null)} />
       ) : (
         <>
           <button

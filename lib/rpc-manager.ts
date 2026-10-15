@@ -1590,7 +1590,7 @@ function getRegistry(): Map<string, AgentSessionWrapper> {
     process.once("SIGTERM", cleanup);
   }
   for (const session of globalThis.__ompSessions.values()) {
-    if (session.runtimeId && typeof session.syncSessionIdentity === "function") continue;
+    if (Object.getPrototypeOf(session) === AgentSessionWrapper.prototype) continue;
     // HMR retains pre-identity wrappers, including their SDK run and listeners.
     // Upgrade only wrapper instances carrying the existing private state.
     if (!Array.isArray(Reflect.get(session, "listeners"))) continue;
@@ -1639,15 +1639,16 @@ export function getFinalRpcSessionId(runtimeId: string): string | undefined {
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   const registry = getRegistry();
+  // Canonical history IDs never redirect to another transcript. Only an
+  // explicit runtime handle follows the wrapper when the SDK changes its ID.
+  for (const candidate of [...registry.values()]) {
+    if (candidate.isAlive()) candidate.syncSessionIdentity?.();
+  }
   const registered = registry.get(sessionId);
   if (registered?.isAlive() && registered.sessionId === sessionId) return registered;
-  const session = registered?.isAlive() ? registered : [...registry.values()].find(
+  return [...registry.values()].find(
     (candidate) => candidate.isAlive() && (candidate.sessionId === sessionId || candidate.runtimeId === sessionId),
   );
-  // Return the moved wrapper to the discovering request once. Its old ID is
-  // then free to reopen the original transcript rather than redirect forever.
-  session?.syncSessionIdentity();
-  return session ?? registered;
 }
 
 function runtimeMessageText(entry: SessionMessageEntry): string {

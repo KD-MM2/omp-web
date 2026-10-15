@@ -13,6 +13,7 @@ const jiti = createJiti(import.meta.url, {
   moduleCache: false,
 });
 const { GET: getSessionDetail } = await jiti.import("./[id]/route.ts");
+const { GET: getSessionContext } = await jiti.import("./[id]/context/route.ts");
 const { GET: getSessionState } = await jiti.import("./[id]/state/route.ts");
 const { GET: getAgentState } = await jiti.import("../agent/[id]/route.ts");
 
@@ -27,7 +28,7 @@ test("session listing merges live registry snapshots and honors force refresh", 
 test("session reads use the live SessionManager before requiring a JSONL path", () => {
   for (const source of [detailRoute, contextRoute]) {
     const liveLookup = source.indexOf("getRpcSession(id)");
-    const pathLookup = source.indexOf("resolveSessionPath(id)");
+    const pathLookup = source.indexOf("resolveSessionPath(");
     assert.ok(liveLookup >= 0);
     assert.ok(pathLookup > liveLookup);
     assert.match(source, /liveRpc\?\.inner\.sessionManager \?\? (?:await )?SessionManager\.open/);
@@ -44,8 +45,10 @@ test("live agent state is available before the session file is persisted", () =>
 
 test("live detail and state routes work without a persisted JSONL file", async (t) => {
   const previousRegistry = globalThis.__ompSessions;
+  const previousFinalIds = globalThis.__ompFinalSessionIds;
   const id = "live-route-test";
   const runtimeId = "live-route-after-fallback";
+  const handle = "runtime:live-route";
   const timestamp = "2026-08-12T01:02:03.000Z";
   const entry = {
     type: "message",
@@ -68,15 +71,17 @@ test("live detail and state routes work without a persisted JSONL file", async (
     inner: { sessionManager },
     sessionFile: sessionManager.getSessionFile(),
     sessionId: runtimeId,
+    runtimeId: handle,
     syncSessionIdentity: () => {},
     cwd: "/tmp",
     send: async () => ({ isStreaming: true }),
   }]]);
   t.after(() => {
     globalThis.__ompSessions = previousRegistry;
+    globalThis.__ompFinalSessionIds = previousFinalIds;
   });
 
-  const routeContext = { params: Promise.resolve({ id }) };
+  const routeContext = { params: Promise.resolve({ id: handle }) };
   const detailResponse = await getSessionDetail(
     new Request(`http://localhost/api/sessions/${id}`, { headers: { host: "localhost" } }),
     routeContext,
@@ -89,6 +94,7 @@ test("live detail and state routes work without a persisted JSONL file", async (
 
   assert.equal(detailResponse.status, 200);
   assert.equal(detail.sessionId, runtimeId);
+  assert.equal(detail.runtimeId, handle);
   assert.equal(detail.info.transient, true);
   assert.deepEqual(detail.context.messages.map((message) => message.content), ["hello live"]);
   assert.equal(stateResponse.status, 200);
@@ -96,6 +102,16 @@ test("live detail and state routes work without a persisted JSONL file", async (
     running: true,
     state: { isStreaming: true },
   });
+
+  globalThis.__ompFinalSessionIds = new Map([["runtime:expired-context", runtimeId]]);
+  const contextResponse = await getSessionContext(new Request("http://localhost/api/sessions/runtime:expired-context/context"), {
+    params: Promise.resolve({ id: "runtime:expired-context" }),
+  });
+  const context = await contextResponse.json();
+  assert.equal(contextResponse.status, 200);
+  assert.equal(context.sessionId, runtimeId);
+  assert.equal(context.runtimeId, handle);
+  assert.deepEqual(context.context.messages.map((message) => message.content), ["hello live"]);
 });
 
 

@@ -77,6 +77,7 @@ export async function GET(
 
     return NextResponse.json({
       sessionId: liveRpc?.sessionId ?? sm.getSessionId(),
+      runtimeId: liveRpc?.runtimeId,
       filePath,
       info,
       leafId,

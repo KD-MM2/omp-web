@@ -174,7 +174,7 @@ test("/handoff forwards the focus text verbatim and keeps the UI busy", () => {
   const dispatchIndex = handoffCaseSource.indexOf('type: "handoff"');
   assert.ok(connectIndex >= 0);
   assert.ok(dispatchIndex > connectIndex);
-  assert.match(handoffCaseSource, /scheduleEventStreamClose\(sid\)/);
+  assert.match(handoffCaseSource, /scheduleEventStreamClose\(finalSid\)/);
 });
 
 test("/handoff reloads the same session after an in-place compaction", () => {
@@ -191,7 +191,7 @@ test("/handoff reloads the same session after an in-place compaction", () => {
   // reloads this transcript instead of navigating to a replacement session.
   assert.doesNotMatch(handoffCaseSource, /newSessionId/);
   assert.doesNotMatch(handoffCaseSource, /onSessionForked/);
-  assert.match(handoffCaseSource, /if \(await loadSession\(currentSid, true\)\) promoteNewSession\(\);/);
+  assert.match(handoffCaseSource, /loadSession\(sessionIdRef\.current \?\? currentSid, true\)/);
   // Every branch returns handled so the command never reaches the SDK
   // fallback — the busy state is torn down in a finally block and the case
   // yields to the default bridge with a return.
