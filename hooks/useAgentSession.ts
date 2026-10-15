@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect, useMemo, useReducer } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, useReducer } from "react";
 import type {
   AgentMessage,
   BlockingExtensionUiRequest,
@@ -339,6 +339,7 @@ export interface ChatInputHandle {
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
   restoreSubmission: (text: string, images?: Array<{ data: string; mimeType: string }>, targetDraftKey?: string) => void;
+  rekeyDraft?: (previousKey: string, nextKey: string) => void;
 }
 
 export interface AttachedImage {
@@ -425,6 +426,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const runtimeIdRef = useRef<string | null>(session?.runtimeId ?? null);
+  const mountedRef = useRef(false);
+  const identityDraftKeyRef = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    identityDraftKeyRef.current = session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined);
+    return () => { mountedRef.current = false; };
+  }, [session?.id, newSessionCwd]);
   const agentRunningRef = useRef(false);
   const sdkAgentActiveRef = useRef(false);
   const rpcPromptPendingRef = useRef(false);
@@ -500,17 +508,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
   const followSessionIdentity = useCallback((nextId: string, runtimeId?: string) => {
+    if (!mountedRef.current) return;
     if (runtimeId) runtimeIdRef.current = runtimeId;
     if (nextId === sessionIdRef.current) return;
     // Async sends awaiting the SSE handshake must use the new ID immediately;
     // waiting for the parent to remount leaves captured IDs pointing at history.
+    if (identityDraftKeyRef.current) {
+      opts.chatInputRef?.current?.rekeyDraft?.(identityDraftKeyRef.current, nextId);
+    }
+    identityDraftKeyRef.current = nextId;
     sessionIdRef.current = nextId;
     eventSourceSessionIdRef.current = nextId;
     onSessionForked?.(nextId, runtimeIdRef.current ?? undefined);
-  }, [onSessionForked]);
+  }, [onSessionForked, opts.chatInputRef]);
 
   const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
-    if (sessionIdRef.current !== requestedId) return true;
+    if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
     if (state?.runtimeId) runtimeIdRef.current = state.runtimeId;
     if (state?.sessionId && state.sessionId !== requestedId) {
       followSessionIdentity(state.sessionId, state.runtimeId);
@@ -536,7 +549,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      if (!mountedRef.current || sessionIdRef.current !== sid) return null;
       if (d.sessionId !== sid && onSessionForked) {
         followSessionIdentity(d.sessionId);
         return null;
@@ -561,7 +574,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           : `/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (!mountedRef.current || sessionIdRef.current !== sid) return null;
 
         const liveState = agentState.state;
         if (!agentState.running) runtimeIdRef.current = null;
