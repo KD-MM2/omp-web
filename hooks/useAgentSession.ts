@@ -16,7 +16,7 @@ import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { stripAnsi } from "@/lib/ansi";
 import { isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
-import { rememberSessionContinuation } from "@/lib/workspace-memory";
+import { rememberSessionContinuation, clearSessionContinuation } from "@/lib/workspace-memory";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import type { ContextUsage, GoalStatusInfo, SessionStatsInfo, SlashCommandInfo } from "@/lib/omp-types";
 import type { ModelRoleAssignment } from "@/lib/api-types";
@@ -533,7 +533,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
     if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
     if (state?.sessionId) {
+      const expiredRuntimeId = !state.runtimeId ? runtimeIdRef.current : null;
       followSessionIdentity(state.sessionId, state.runtimeId);
+      if (expiredRuntimeId) {
+        clearSessionContinuation(undefined, expiredRuntimeId);
+        runtimeIdRef.current = null;
+      }
     }
     return false;
   }, [followSessionIdentity]);

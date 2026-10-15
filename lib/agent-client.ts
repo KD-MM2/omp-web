@@ -1,3 +1,5 @@
+import { clearSessionContinuation } from "./workspace-memory";
+
 // Client-side helper for POST /api/agent/[id].
 //
 // Every /api/agent/[id] route returns one of:
@@ -49,6 +51,7 @@ export async function sendAgentCommand<T = unknown>(
     if (runtimeId && runtime?.current === runtimeId && res.status === 404
       && body.code === "runtime_expired" && body.accepted === false && body.sessionId) {
       runtime.onSessionId?.(body.sessionId);
+      clearSessionContinuation(undefined, runtimeId);
       runtime.current = null;
       return sendAgentCommand<T>(body.sessionId, command);
     }

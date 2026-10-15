@@ -119,6 +119,9 @@ export function rememberSessionContinuation(sessionId: string, runtimeId: string
   try { storage?.setItem(CONTINUATION_KEY, JSON.stringify({ sessionId, runtimeId })); } catch { /* Storage is optional. */ }
 }
 
-export function clearSessionContinuation(storage: StorageLike | null = getTabStorage()): void {
-  try { storage?.removeItem(CONTINUATION_KEY); } catch { /* Storage is optional. */ }
+export function clearSessionContinuation(storage: StorageLike | null = getTabStorage(), expectedRuntimeId?: string): void {
+  try {
+    if (expectedRuntimeId && JSON.parse(storage?.getItem(CONTINUATION_KEY) ?? "null")?.runtimeId !== expectedRuntimeId) return;
+    storage?.removeItem(CONTINUATION_KEY);
+  } catch { /* Storage is optional. */ }
 }

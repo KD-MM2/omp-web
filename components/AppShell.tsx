@@ -439,15 +439,14 @@ export function AppShell() {
     // project switch and the just-selected session is cleared.
     activeProjectRootRef.current = session.projectRoot ?? session.cwd;
     invalidateWorkspaceRestore();
-    // Re-clicking the already-open session must not remount the chat and
-    // re-run the full load/positioning cycle. Only skip when the effective
-    // cwd context already matches — otherwise a pending cwd move still needs
-    // the full re-select flow.
+    // A current row with a continuation handle can explicitly reopen history,
+    // including recovery from a handle unknown after a server restart.
+    // Keep ordinary same-session clicks as a no-op.
     if (!isRestore && selectedSession) {
       const sameProject =
         (selectedSession.projectRoot ?? selectedSession.cwd) ===
         (session.projectRoot ?? session.cwd);
-      if (selectedSession.id === session.id && sameProject) {
+      if (selectedSession.id === session.id && sameProject && !selectedSession.runtimeId) {
         if (isMobile) setSidebarOpen(false);
         return;
       }
