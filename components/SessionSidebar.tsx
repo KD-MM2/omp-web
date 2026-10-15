@@ -481,9 +481,13 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
   const [changesCollapsed, setChangesCollapsed] = useState(true);
   const [sessionRefreshDone, setSessionRefreshDone] = useState(false);
   const [explorerRefreshDone, setExplorerRefreshDone] = useState(false);
-  const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
+  const [activitySnapshot, setActivitySnapshot] = useState<{
+    runningSessionIds?: string[];
+    sessionIdsByRuntimeId?: Record<string, string>;
+  }>({});
+  const runningSessionIds = useMemo(() => new Set(activitySnapshot.runningSessionIds ?? []), [activitySnapshot]);
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
-  const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
+  const previousActivitySnapshotRef = useRef(activitySnapshot);
   // Once polling has delivered a snapshot it is the source of truth for
   // running state; late /api/sessions responses must not overwrite it.
   const runningPollAuthoritativeRef = useRef(false);
@@ -503,12 +507,12 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
         cache: "no-store",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[] };
+      const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[]; sessionIdsByRuntimeId?: Record<string, string> };
       setAllSessions(data.sessions);
       // Treat the fetched running set as an initial fallback only. Once the
       // lightweight poll is live, a slow session-list fetch cannot overwrite it.
       if (!runningPollAuthoritativeRef.current) {
-        setRunningSessionIds(new Set(data.runningSessionIds ?? []));
+        setActivitySnapshot({ runningSessionIds: data.runningSessionIds, sessionIdsByRuntimeId: data.sessionIdsByRuntimeId });
       }
       // Drop unread markers for sessions that no longer exist (e.g. deleted).
       const existingIds = new Set(data.sessions.map((s) => s.id));
@@ -584,10 +588,10 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
           signal: current.signal,
         });
         if (!res.ok) return;
-        const data = await res.json() as { runningSessionIds?: string[] };
+        const data = await res.json() as { runningSessionIds?: string[]; sessionIdsByRuntimeId?: Record<string, string> };
         if (stopped || controller !== current) return;
         runningPollAuthoritativeRef.current = true;
-        setRunningSessionIds(new Set(data.runningSessionIds ?? []));
+        setActivitySnapshot({ runningSessionIds: data.runningSessionIds, sessionIdsByRuntimeId: data.sessionIdsByRuntimeId });
       } catch {
         // Keep the last known state; the next visible-tab poll retries.
       } finally {
@@ -617,8 +621,17 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
   }, []);
 
   useEffect(() => {
-    const previous = previousRunningSessionIdsRef.current;
-    const completedInBackground = [...previous].filter((id) => !runningSessionIds.has(id) && id !== selectedSessionId);
+    const previousSnapshot = previousActivitySnapshotRef.current;
+    const previous = new Set(previousSnapshot.runningSessionIds ?? []);
+    // Compare the same live wrapper across fallback IDs before reporting completion.
+    const previousRuntimeIds = new Map(Object.entries(previousSnapshot.sessionIdsByRuntimeId ?? {})
+      .map(([runtimeId, sessionId]) => [sessionId, runtimeId]));
+    const completedInBackground = [...previous].flatMap((id) => {
+      const runtimeId = previousRuntimeIds.get(id);
+      const currentId = (runtimeId && activitySnapshot.sessionIdsByRuntimeId?.[runtimeId]) || id;
+      return !runningSessionIds.has(currentId) && id !== selectedSessionId && currentId !== selectedSessionId
+        ? [currentId] : [];
+    });
     const newlyRunning = [...runningSessionIds].filter((id) => !previous.has(id));
 
     if (completedInBackground.length > 0 || newlyRunning.length > 0) {
@@ -639,8 +652,8 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
       onBackgroundTaskDone?.();
     }
 
-    previousRunningSessionIdsRef.current = runningSessionIds;
-  }, [runningSessionIds, selectedSessionId, allSessions, loadSessions, onBackgroundTaskDone]);
+    previousActivitySnapshotRef.current = activitySnapshot;
+  }, [activitySnapshot, runningSessionIds, selectedSessionId, allSessions, loadSessions, onBackgroundTaskDone]);
 
   useEffect(() => {
     if (!selectedSessionId) return;

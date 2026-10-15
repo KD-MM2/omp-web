@@ -1713,6 +1713,19 @@ export async function destroyRpcSessionsForCwd(cwd: string): Promise<number> {
   return sessions.length;
 }
 
+// Include idle wrappers so a run that changes ID and finishes between polls
+// is attributed to its final transcript rather than its historical ID.
+export function getRpcSessionActivitySnapshot() {
+  const runningSessionIds = new Set<string>();
+  const sessionIdsByRuntimeId: Record<string, string> = {};
+  for (const session of getRegistry().values()) {
+    if (!session.isAlive()) continue;
+    sessionIdsByRuntimeId[session.runtimeId] = session.sessionId;
+    if (session.isRunning()) runningSessionIds.add(session.sessionId);
+  }
+  return { runningSessionIds: [...runningSessionIds], sessionIdsByRuntimeId };
+}
+
 export function getRunningRpcSessionIds(): string[] {
   const ids = new Set<string>();
   for (const [sessionId, session] of getRegistry()) {
