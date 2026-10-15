@@ -1592,7 +1592,13 @@ function trackStartingSession(cwd: string): () => void {
 }
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
-  return getRegistry().get(sessionId);
+  const registry = getRegistry();
+  const registered = registry.get(sessionId);
+  if (registered?.isAlive()) return registered;
+  // The SDK can fork in place during model fallback. Keep the original key
+  // for in-flight requests, but also accept the wrapper's current identity.
+  return [...registry.values()].find((session) => session.isAlive() && session.sessionId === sessionId)
+    ?? registered;
 }
 
 function runtimeMessageText(entry: SessionMessageEntry): string {
@@ -1747,8 +1753,8 @@ export async function startRpcSession(
   const registry = getRegistry();
   const locks = getLocks();
 
-  const existing = registry.get(sessionId);
-  if (existing?.isAlive()) return { session: existing, realSessionId: sessionId };
+  const existing = getRpcSession(sessionId);
+  if (existing?.isAlive()) return { session: existing, realSessionId: existing.sessionId };
 
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;

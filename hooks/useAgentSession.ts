@@ -76,6 +76,8 @@ interface LastAssistantTextResponse {
 }
 
 type AgentStateResponse = {
+  sessionId?: string;
+  model?: { provider: string; id: string };
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   systemPrompt?: string;
   thinkingLevel?: string;
@@ -513,6 +515,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (sessionIdRef.current !== sid) return null;
+      if (d.sessionId !== sid && onSessionForked) {
+        onSessionForked(d.sessionId);
+        return null;
+      }
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(d.context.messages);
@@ -559,7 +565,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
     }
-  }, []);
+  }, [onSessionForked]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     try {
@@ -1103,11 +1109,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         || sessionIdRef.current !== sid
         || promptRunIdRef.current !== runId
       ) return;
+      if (data.state?.sessionId && data.state.sessionId !== sid && onSessionForked) {
+        onSessionForked(data.state.sessionId);
+        return;
+      }
+      if (data.state?.model && !modelSwitchPendingRef.current) {
+        setCurrentModelOverride({ provider: data.state.model.provider, modelId: data.state.model.id });
+      }
       if (data.state?.contextUsage !== undefined) setContextUsage(data.state.contextUsage ?? null);
     } catch {
       // The next refresh retries; state reconciliation owns error recovery.
     }
-  }, []);
+  }, [onSessionForked]);
 
   // Context usage changes after each model/tool turn, not only when the prompt
   // settles. Poll the lightweight state endpoint while the session is active
