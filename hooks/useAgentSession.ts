@@ -564,7 +564,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!mountedRef.current || sessionIdRef.current !== sid) return null;
       if (d.sessionId !== sid && onSessionForked) {
         followSessionIdentity(d.sessionId);
-        return null;
+        sid = d.sessionId;
       }
       setData(d);
       setActiveLeafId(d.leafId);
@@ -2193,8 +2193,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (session) {
       sessionIdRef.current = session.id;
       loadSession(session.id, true, true).then((agentState) => {
+        const sid = sessionIdRef.current;
+        if (!mountedRef.current || !sid) return;
         if (agentState?.running) {
-          loadTools(session.id);
+          loadTools(sid);
           if (
             agentState.state?.isStreaming
             || agentState.state?.isPromptRunning
@@ -2206,18 +2208,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             setAgentRunning(true);
             setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
             dispatch({ type: "start" });
-            void connectEvents(session.id);
+            void connectEvents(sid);
             if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {
-              void waitForPromptSettlement(session.id);
+              void waitForPromptSettlement(sid);
             }
           }
           if (agentState.state?.isBashRunning) {
             bashRunningRef.current = true;
             setBashRunning(true);
-            void waitForBashSettlement(session.id);
+            void waitForBashSettlement(sid);
           }
           if ((agentState.state?.subagents?.length ?? 0) > 0) {
-            void connectEvents(session.id);
+            void connectEvents(sid);
           }
         }
         const state = agentState?.state;

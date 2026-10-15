@@ -79,6 +79,7 @@ function ToolbarIconButton({
 
 interface Props {
   selectedSessionId: string | null;
+  selectedRuntimeId?: string;
   optimisticSession?: SessionInfo | null;
   onSelectSession: (session: SessionInfo, isRestore?: boolean) => void;
   onNewSession?: (sessionId: string, cwd: string) => void;
@@ -444,7 +445,7 @@ function PiWebTitle() {
   );
 }
 
-export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone }: Props) {
+export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
   const sessionsForDisplay = optimisticSession && !allSessions.some((session) => session.id === optimisticSession.id)
@@ -626,10 +627,13 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     // Compare the same live wrapper across fallback IDs before reporting completion.
     const previousRuntimeIds = new Map(Object.entries(previousSnapshot.sessionIdsByRuntimeId ?? {})
       .map(([runtimeId, sessionId]) => [sessionId, runtimeId]));
+    const selectedCanonicalId = selectedRuntimeId
+      ? activitySnapshot.sessionIdsByRuntimeId?.[selectedRuntimeId] ?? selectedSessionId
+      : selectedSessionId;
     const completedInBackground = [...previous].flatMap((id) => {
       const runtimeId = previousRuntimeIds.get(id);
       const currentId = (runtimeId && activitySnapshot.sessionIdsByRuntimeId?.[runtimeId]) || id;
-      return !runningSessionIds.has(currentId) && id !== selectedSessionId && currentId !== selectedSessionId
+      return !runningSessionIds.has(currentId) && id !== selectedSessionId && currentId !== selectedSessionId && currentId !== selectedCanonicalId
         ? [currentId] : [];
     });
     const newlyRunning = [...runningSessionIds].filter((id) => !previous.has(id));
@@ -653,7 +657,7 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     }
 
     previousActivitySnapshotRef.current = activitySnapshot;
-  }, [activitySnapshot, runningSessionIds, selectedSessionId, allSessions, loadSessions, onBackgroundTaskDone]);
+  }, [activitySnapshot, runningSessionIds, selectedSessionId, selectedRuntimeId, allSessions, loadSessions, onBackgroundTaskDone]);
 
   useEffect(() => {
     if (!selectedSessionId) return;

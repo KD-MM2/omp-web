@@ -27,7 +27,7 @@ import {
   showBrowserNotification,
 } from "@/lib/browser-notifications";
 import { getInitialNavigation } from "@/lib/initial-navigation";
-import { clearLastOpen, getLastOpenSession, setLastOpenSession, getSessionContinuation, clearSessionContinuation } from "@/lib/workspace-memory";
+import { clearLastOpen, getLastOpenSession, setLastOpenSession, getSessionContinuation, clearSessionContinuation, rememberSessionContinuation } from "@/lib/workspace-memory";
 import {
   getDefaultRightPanelWidth,
   getRightPanelMaxWidth,
@@ -588,25 +588,31 @@ export function AppShell() {
 
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
+    const runtimeId = selectedSession?.runtimeId;
     if (!sessionId || autoNameStatus.kind === "naming") return;
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
 
     try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/auto-name`, {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(runtimeId ?? sessionId)}/auto-name`, {
         method: "POST",
       });
-      const body = (await response.json().catch(() => ({}))) as { title?: string; error?: string };
+      const body = (await response.json().catch(() => ({}))) as { title?: string; error?: string; sessionId?: string; runtimeId?: string };
       if (!response.ok || !body.title) {
         throw new Error(body.error || `HTTP ${response.status}`);
       }
 
       const title = body.title.trim();
       setRefreshKey((key) => key + 1);
-      if (activeSessionIdRef.current !== sessionId) return;
-      setSelectedSession((current) => current?.id === sessionId ? { ...current, name: title } : current);
-      setSessionStats((current) => current?.sessionId === sessionId ? { ...current, sessionName: title } : current);
+      if (runtimeId ? activeRuntimeIdRef.current !== runtimeId : activeSessionIdRef.current !== sessionId) return;
+      const canonicalId = body.sessionId ?? sessionId;
+      if (activeSessionIdRef.current) chatInputRef.current?.rekeyDraft(activeSessionIdRef.current, canonicalId);
+      if (body.runtimeId) rememberSessionContinuation(canonicalId, body.runtimeId);
+      setSelectedSession((current) => current && (runtimeId ? current.runtimeId === runtimeId : current.id === sessionId)
+        ? { ...current, id: canonicalId, runtimeId: body.runtimeId, name: title } : current);
+      setSessionStats((current) => current ? { ...current, sessionId: canonicalId, sessionName: title } : current);
+      router.replace(`?session=${encodeURIComponent(canonicalId)}`, { scroll: false });
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
@@ -615,7 +621,7 @@ export function AppShell() {
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [autoNameStatus.kind, selectedSession?.id, selectedSession?.runtimeId, router]);
 
   useEffect(() => {
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
@@ -802,6 +808,7 @@ export function AppShell() {
     <>
       <SessionSidebar
         selectedSessionId={selectedSession?.id ?? null}
+        selectedRuntimeId={selectedSession?.runtimeId}
         optimisticSession={selectedSession}
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
