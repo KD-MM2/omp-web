@@ -280,6 +280,7 @@ export async function getAvailableSlashCommands(session: AgentSessionLike): Prom
 // ============================================================================
 
 export class AgentSessionWrapper {
+  readonly runtimeId = `runtime:${randomUUID()}`;
   private listeners: EventListener[] = [];
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
@@ -739,7 +740,7 @@ export class AgentSessionWrapper {
     if (this.sessionFile) cacheSessionPath(currentId, this.sessionFile);
     invalidateSessionListCache();
     // Existing streams still hold this wrapper after its registry key moves.
-    for (const listener of this.listeners) listener({ type: "session_changed", sessionId: currentId });
+    for (const listener of this.listeners) listener({ type: "session_changed", sessionId: currentId, runtimeId: this.runtimeId });
   }
 
   private emit(event: AgentEvent): void {
@@ -855,6 +856,7 @@ export class AgentSessionWrapper {
         const contextUsage = this.inner.getContextUsage();
         return {
           sessionId: this.inner.sessionId,
+          runtimeId: this.runtimeId,
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
           isPromptRunning: this.promptRunning,
@@ -1620,7 +1622,7 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
   const registered = registry.get(sessionId);
   if (registered?.isAlive() && registered.sessionId === sessionId) return registered;
   const session = registered?.isAlive() ? registered : [...registry.values()].find(
-    (candidate) => candidate.isAlive() && candidate.sessionId === sessionId,
+    (candidate) => candidate.isAlive() && (candidate.sessionId === sessionId || candidate.runtimeId === sessionId),
   );
   // Return the moved wrapper to the discovering request once. Its old ID is
   // then free to reopen the original transcript rather than redirect forever.

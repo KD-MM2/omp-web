@@ -39,7 +39,7 @@ test("keeps the session event stream open through the idle grace window", () => 
 
   assert.match(source, /const EVENT_STREAM_IDLE_GRACE_MS = 30_000/);
   assert.match(graceSource, /setTimeout\(\(\) => void checkServerIdle\(\), EVENT_STREAM_IDLE_GRACE_MS\)/);
-  assert.match(graceSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}`\)/);
+  assert.match(graceSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(runtimeIdRef\.current \?\? sid\)\}`\)/);
   assert.match(graceSource, /closeEvents\(\)/);
   assert.match(finishSource, /scheduleEventStreamClose\(sid\)/);
   assert.doesNotMatch(finishSource, /closeEvents\(\)/);
@@ -170,7 +170,7 @@ test("/handoff forwards the focus text verbatim and keeps the UI busy", () => {
   assert.match(handoffCaseSource, /complete\(\{ handled: true, error: "Handoff cancelled" \}\)/);
   assert.doesNotMatch(handoffCaseSource, /execute_slash_command/);
   assert.doesNotMatch(handoffCaseSource, /type: "prompt"/);
-  const connectIndex = handoffCaseSource.indexOf("await ensureEventsConnected(sid)");
+  const connectIndex = handoffCaseSource.indexOf("await ensureEventsConnected(sessionIdRef.current ?? sid)");
   const dispatchIndex = handoffCaseSource.indexOf('type: "handoff"');
   assert.ok(connectIndex >= 0);
   assert.ok(dispatchIndex > connectIndex);
@@ -191,7 +191,7 @@ test("/handoff reloads the same session after an in-place compaction", () => {
   // reloads this transcript instead of navigating to a replacement session.
   assert.doesNotMatch(handoffCaseSource, /newSessionId/);
   assert.doesNotMatch(handoffCaseSource, /onSessionForked/);
-  assert.match(handoffCaseSource, /if \(await loadSession\(sid, true\)\) promoteNewSession\(\);/);
+  assert.match(handoffCaseSource, /if \(await loadSession\(currentSid, true\)\) promoteNewSession\(\);/);
   // Every branch returns handled so the command never reaches the SDK
   // fallback — the busy state is torn down in a finally block and the case
   // yields to the default bridge with a return.

@@ -453,7 +453,7 @@ export function AppShell() {
       }
     }
     setNewSessionCwd(null);
-    setSelectedSession(session);
+    setSelectedSession({ ...session, runtimeId: undefined });
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
     setInitialSessionRestored(true);
@@ -621,7 +621,7 @@ export function AppShell() {
     setExplorerRefreshKey((k) => k + 1);
   }, []);
 
-  const handleSessionForked = useCallback((newSessionId: string) => {
+  const handleSessionForked = useCallback((newSessionId: string, runtimeId?: string) => {
     invalidateWorkspaceRestore();
     setRefreshKey((k) => k + 1);
     setSessionKey((k) => k + 1);
@@ -629,6 +629,7 @@ export function AppShell() {
     setSelectedSession((prev) => ({
       ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
       id: newSessionId,
+      runtimeId,
       transient: false,
     }));
     hydrateSelectedSession(newSessionId);

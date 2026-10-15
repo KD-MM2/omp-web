@@ -31,6 +31,12 @@ export async function POST(
       return NextResponse.json({ success: true, data: result });
     }
 
+    if (id.startsWith("runtime:")) {
+      return NextResponse.json({
+        error: "Runtime session expired", code: "runtime_expired", accepted: false,
+      }, { status: 404 });
+    }
+
     const filePath = await resolveSessionPath(id);
     if (!filePath) {
       return NextResponse.json({

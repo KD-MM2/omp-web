@@ -87,6 +87,7 @@ export async function POST(req: Request) {
       return NextResponse.json({
         success: true,
         sessionId: realSessionId,
+        runtimeId: session.runtimeId,
         data: null,
         model: state.model
           ? { provider: state.model.provider, modelId: state.model.id }
@@ -102,6 +103,7 @@ export async function POST(req: Request) {
     return NextResponse.json({
       success: true,
       sessionId: realSessionId,
+      runtimeId: session.runtimeId,
       data: result,
       model: state.model
         ? { provider: state.model.provider, modelId: state.model.id }
