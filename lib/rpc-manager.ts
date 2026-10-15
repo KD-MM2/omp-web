@@ -1589,6 +1589,17 @@ function getRegistry(): Map<string, AgentSessionWrapper> {
     process.once("SIGINT", cleanup);
     process.once("SIGTERM", cleanup);
   }
+  for (const session of globalThis.__ompSessions.values()) {
+    if (session.runtimeId && typeof session.syncSessionIdentity === "function") continue;
+    // HMR retains pre-identity wrappers, including their SDK run and listeners.
+    // Upgrade only wrapper instances carrying the existing private state.
+    if (!Array.isArray(Reflect.get(session, "listeners"))) continue;
+    if (!session.runtimeId) Object.defineProperty(session, "runtimeId", { value: `runtime:${randomUUID()}` });
+    // The old manager callback deleted the startup ID even after relocation.
+    // Current destroy() removes entries by wrapper identity instead.
+    Reflect.set(session, "onDestroyCallback", null);
+    Object.setPrototypeOf(session, AgentSessionWrapper.prototype);
+  }
   return globalThis.__ompSessions;
 }
 
