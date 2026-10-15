@@ -1545,6 +1545,7 @@ export class AgentSessionWrapper {
 
 declare global {
   var __ompSessions: Map<string, AgentSessionWrapper> | undefined;
+  var __ompSessionAliases: WeakMap<AgentSessionWrapper, Set<string>> | undefined;
   var __ompStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompStartingSessionCwds: Map<string, number> | undefined;
   var __ompRunningListeners: Set<(ids: string[]) => void> | undefined;
@@ -1593,11 +1594,22 @@ function trackStartingSession(cwd: string): () => void {
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   const registry = getRegistry();
+  const aliases = globalThis.__ompSessionAliases ??= new WeakMap<AgentSessionWrapper, Set<string>>();
+  // The SDK can change a wrapper's ID repeatedly during fallback. Remember
+  // observed identities without duplicating wrappers in the registry; the weak
+  // keys release their alias sets when a destroyed wrapper is collected.
+  for (const [registeredId, session] of registry) {
+    if (!session.isAlive()) continue;
+    let ids = aliases.get(session);
+    if (!ids) {
+      ids = new Set([registeredId]);
+      aliases.set(session, ids);
+    }
+    ids.add(session.sessionId);
+  }
   const registered = registry.get(sessionId);
   if (registered?.isAlive()) return registered;
-  // The SDK can fork in place during model fallback. Keep the original key
-  // for in-flight requests, but also accept the wrapper's current identity.
-  return [...registry.values()].find((session) => session.isAlive() && session.sessionId === sessionId)
+  return [...registry.values()].find((session) => session.isAlive() && aliases.get(session)?.has(sessionId))
     ?? registered;
 }
 

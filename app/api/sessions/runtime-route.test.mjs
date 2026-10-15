@@ -44,6 +44,7 @@ test("live agent state is available before the session file is persisted", () =>
 test("live detail and state routes work without a persisted JSONL file", async (t) => {
   const previousRegistry = globalThis.__ompSessions;
   const id = "live-route-test";
+  const runtimeId = "live-route-after-fallback";
   const timestamp = "2026-08-12T01:02:03.000Z";
   const entry = {
     type: "message",
@@ -65,7 +66,7 @@ test("live detail and state routes work without a persisted JSONL file", async (
     isRunning: () => true,
     inner: { sessionManager },
     sessionFile: sessionManager.getSessionFile(),
-    sessionId: id,
+    sessionId: runtimeId,
     cwd: "/tmp",
     send: async () => ({ isStreaming: true }),
   }]]);
@@ -85,6 +86,7 @@ test("live detail and state routes work without a persisted JSONL file", async (
   const detail = await detailResponse.json();
 
   assert.equal(detailResponse.status, 200);
+  assert.equal(detail.sessionId, runtimeId);
   assert.equal(detail.info.transient, true);
   assert.deepEqual(detail.context.messages.map((message) => message.content), ["hello live"]);
   assert.equal(stateResponse.status, 200);
