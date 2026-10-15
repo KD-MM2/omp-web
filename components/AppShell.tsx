@@ -27,7 +27,7 @@ import {
   showBrowserNotification,
 } from "@/lib/browser-notifications";
 import { getInitialNavigation } from "@/lib/initial-navigation";
-import { clearLastOpen, getLastOpenSession, setLastOpenSession, getSessionContinuation, clearSessionContinuation, rememberSessionContinuation } from "@/lib/workspace-memory";
+import { clearLastOpen, getLastOpenSession, setLastOpenSession, getSessionContinuation, clearSessionContinuation, rememberSessionContinuation, restoreSessionContinuation } from "@/lib/workspace-memory";
 import {
   getDefaultRightPanelWidth,
   getRightPanelMaxWidth,
@@ -356,10 +356,10 @@ export function AppShell() {
     const lastOpenSessionId = getLastOpenSession(projectKey);
     if (!lastOpenSessionId) return;
     void fetch("/api/sessions")
-      .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
+      .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[]; sessionIdsByRuntimeId?: Record<string, string> }>) : null))
       .then((d) => {
         if (token !== workspaceRestoreTokenRef.current) return; // stale switch
-        const s = d?.sessions.find((x) => x.id === lastOpenSessionId);
+        const s = d ? restoreSessionContinuation(lastOpenSessionId, d.sessions, d.sessionIdsByRuntimeId) : undefined;
         if (!s) {
           // The list loaded but the remembered session is gone — forget it.
           // When the list itself failed (d === null) keep the memory so a
@@ -376,7 +376,7 @@ export function AppShell() {
         // present: useAgentSession loads content in a mount-only effect, so
         // the null-session welcome mount from the switch would never load
         // the restored session's messages.
-        setSelectedSession({ ...s, runtimeId: getSessionContinuation(s.id) });
+        setSelectedSession(s);
         setSessionKey((k) => k + 1);
         if (new URLSearchParams(window.location.search).get("session") !== s.id) {
           router.replace(`?session=${encodeURIComponent(s.id)}`, { scroll: false });
@@ -455,7 +455,7 @@ export function AppShell() {
     }
     setNewSessionCwd(null);
     if (!isRestore) clearSessionContinuation();
-    setSelectedSession({ ...session, runtimeId: isRestore ? getSessionContinuation(session.id) : undefined });
+    setSelectedSession({ ...session, runtimeId: isRestore ? session.runtimeId ?? getSessionContinuation(session.id) : undefined });
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
     setInitialSessionRestored(true);

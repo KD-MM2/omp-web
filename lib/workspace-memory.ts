@@ -1,3 +1,5 @@
+import type { SessionInfo } from "./types";
+
 /**
  * Per-workspace "last open session" memory.
  *
@@ -124,4 +126,19 @@ export function clearSessionContinuation(storage: StorageLike | null = getTabSto
     if (expectedRuntimeId && JSON.parse(storage?.getItem(CONTINUATION_KEY) ?? "null")?.runtimeId !== expectedRuntimeId) return;
     storage?.removeItem(CONTINUATION_KEY);
   } catch { /* Storage is optional. */ }
+}
+
+
+/** Resolve a saved tab continuation before requiring its old history row. */
+export function restoreSessionContinuation(
+  sessionId: string,
+  sessions: SessionInfo[],
+  sessionIdsByRuntimeId: Record<string, string> = {},
+  storage: StorageLike | null = getTabStorage(),
+): SessionInfo | undefined {
+  const runtimeId = getSessionContinuation(sessionId, storage);
+  const canonicalId = runtimeId ? sessionIdsByRuntimeId[runtimeId] ?? sessionId : sessionId;
+  const session = sessions.find((entry) => entry.id === canonicalId)
+    ?? sessions.find((entry) => entry.id === sessionId);
+  return session ? { ...session, id: canonicalId, runtimeId } : undefined;
 }

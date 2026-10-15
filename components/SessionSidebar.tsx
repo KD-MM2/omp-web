@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, typ
 import type { SessionInfo } from "@/lib/types";
 import { loadExplorerOpen, saveExplorerOpen } from "@/lib/file-explorer-state";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
+import { restoreSessionContinuation } from "@/lib/workspace-memory";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import { useI18n } from "@/hooks/useI18n";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -489,6 +490,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
   const runningSessionIds = useMemo(() => new Set(activitySnapshot.runningSessionIds ?? []), [activitySnapshot]);
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
   const previousActivitySnapshotRef = useRef(activitySnapshot);
+  const listedRuntimeIdsRef = useRef<Record<string, string>>({});
   // Once polling has delivered a snapshot it is the source of truth for
   // running state; late /api/sessions responses must not overwrite it.
   const runningPollAuthoritativeRef = useRef(false);
@@ -509,6 +511,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[]; sessionIdsByRuntimeId?: Record<string, string> };
+      listedRuntimeIdsRef.current = data.sessionIdsByRuntimeId ?? {};
       setAllSessions(data.sessions);
       // Treat the fetched running set as an initial fallback only. Once the
       // lightweight poll is live, a slow session-list fetch cannot overwrite it.
@@ -753,7 +756,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
       // If restoring a session, set cwd to match that session
       if (initialSessionId && !restoredRef.current) {
         restoredRef.current = true;
-        const target = allSessions.find((s) => s.id === initialSessionId);
+        const target = restoreSessionContinuation(initialSessionId, allSessions, listedRuntimeIdsRef.current);
         if (target) {
           setSelectedCwd(target.cwd);
           onSelectSession(target, true);

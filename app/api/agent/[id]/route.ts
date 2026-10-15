@@ -71,10 +71,13 @@ export async function GET(
   const { id } = await params;
 
   try {
-    const session = getRpcSession(id);
+    let session = getRpcSession(id);
     if (!session || !session.isAlive()) {
       const sessionId = getFinalRpcSessionId(id);
-      return NextResponse.json({ running: false, ...(sessionId ? { state: { sessionId } } : {}) });
+      session = sessionId ? getRpcSession(sessionId) : undefined;
+      if (!session?.isAlive()) {
+        return NextResponse.json({ running: false, ...(sessionId ? { state: { sessionId } } : {}) });
+      }
     }
 
     const state = await session.send({ type: "get_state" });

@@ -14,6 +14,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const { GET: getSessionDetail } = await jiti.import("./[id]/route.ts");
 const { GET: getSessionState } = await jiti.import("./[id]/state/route.ts");
+const { GET: getAgentState } = await jiti.import("../agent/[id]/route.ts");
 
 test("session listing merges live registry snapshots and honors force refresh", () => {
   assert.match(listRoute, /searchParams\.get\("force"\) === "1"/);
@@ -95,4 +96,28 @@ test("live detail and state routes work without a persisted JSONL file", async (
     running: true,
     state: { isStreaming: true },
   });
+});
+
+
+test("an expired runtime reports a reopened canonical session's live state", async (t) => {
+  const previousRegistry = globalThis.__ompSessions;
+  const previousFinalIds = globalThis.__ompFinalSessionIds;
+  const state = { sessionId: "reopened-b", runtimeId: "runtime:new", isStreaming: true };
+  globalThis.__ompFinalSessionIds = new Map([["runtime:old", state.sessionId]]);
+  globalThis.__ompSessions = new Map([[state.sessionId, {
+    sessionId: state.sessionId,
+    runtimeId: state.runtimeId,
+    isAlive: () => true,
+    syncSessionIdentity: () => {},
+    send: async (command) => { assert.equal(command.type, "get_state"); return state; },
+  }]]);
+  t.after(() => {
+    globalThis.__ompSessions = previousRegistry;
+    globalThis.__ompFinalSessionIds = previousFinalIds;
+  });
+  const response = await getAgentState(new Request("http://localhost/api/agent/runtime:old"), {
+    params: Promise.resolve({ id: "runtime:old" }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { running: true, state });
 });
