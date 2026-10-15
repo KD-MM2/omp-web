@@ -724,7 +724,26 @@ export class AgentSessionWrapper {
   }
 
 
+  syncSessionIdentity(): void {
+    const registry = globalThis.__ompSessions;
+    const currentId = this.sessionId;
+    if (!registry || registry.get(currentId) === this) return;
+    let moved = false;
+    for (const [id, session] of registry) {
+      if (session !== this) continue;
+      registry.delete(id);
+      moved = true;
+    }
+    if (!moved) return;
+    registry.set(currentId, this);
+    if (this.sessionFile) cacheSessionPath(currentId, this.sessionFile);
+    invalidateSessionListCache();
+    // Existing streams still hold this wrapper after its registry key moves.
+    for (const listener of this.listeners) listener({ type: "session_changed", sessionId: currentId });
+  }
+
   private emit(event: AgentEvent): void {
+    this.syncSessionIdentity();
     for (const l of this.listeners) l(event);
   }
 
@@ -1188,6 +1207,11 @@ export class AgentSessionWrapper {
       void this.inner.dispose?.();
     } finally {
       try {
+        // Runtime fallback can move this wrapper away from its startup ID.
+        // Remove only this instance, preserving separately reopened sessions.
+        for (const [id, session] of globalThis.__ompSessions ?? []) {
+          if (session === this) globalThis.__ompSessions?.delete(id);
+        }
         this.onDestroyCallback?.();
       } finally {
         notifyRunningChange();
@@ -1545,7 +1569,6 @@ export class AgentSessionWrapper {
 
 declare global {
   var __ompSessions: Map<string, AgentSessionWrapper> | undefined;
-  var __ompSessionAliases: WeakMap<AgentSessionWrapper, Set<string>> | undefined;
   var __ompStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompStartingSessionCwds: Map<string, number> | undefined;
   var __ompRunningListeners: Set<(ids: string[]) => void> | undefined;
@@ -1594,23 +1617,15 @@ function trackStartingSession(cwd: string): () => void {
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   const registry = getRegistry();
-  const aliases = globalThis.__ompSessionAliases ??= new WeakMap<AgentSessionWrapper, Set<string>>();
-  // The SDK can change a wrapper's ID repeatedly during fallback. Remember
-  // observed identities without duplicating wrappers in the registry; the weak
-  // keys release their alias sets when a destroyed wrapper is collected.
-  for (const [registeredId, session] of registry) {
-    if (!session.isAlive()) continue;
-    let ids = aliases.get(session);
-    if (!ids) {
-      ids = new Set([registeredId]);
-      aliases.set(session, ids);
-    }
-    ids.add(session.sessionId);
-  }
   const registered = registry.get(sessionId);
-  if (registered?.isAlive()) return registered;
-  return [...registry.values()].find((session) => session.isAlive() && aliases.get(session)?.has(sessionId))
-    ?? registered;
+  if (registered?.isAlive() && registered.sessionId === sessionId) return registered;
+  const session = registered?.isAlive() ? registered : [...registry.values()].find(
+    (candidate) => candidate.isAlive() && candidate.sessionId === sessionId,
+  );
+  // Return the moved wrapper to the discovering request once. Its old ID is
+  // then free to reopen the original transcript rather than redirect forever.
+  session?.syncSessionIdentity();
+  return session ?? registered;
 }
 
 function runtimeMessageText(entry: SessionMessageEntry): string {
@@ -1885,7 +1900,6 @@ export async function startRpcSession(
       const realSessionFile = inner.sessionFile as string | undefined;
       if (realSessionFile) cacheSessionPath(realSessionId, realSessionFile);
 
-      wrapper.onDestroy(() => registry.delete(realSessionId));
       registry.set(realSessionId, wrapper);
       wrapper.beginExtensionBinding({ forceEmptySystemPrompt: toolNames?.length === 0 });
 

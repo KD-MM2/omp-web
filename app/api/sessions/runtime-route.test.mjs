@@ -67,6 +67,7 @@ test("live detail and state routes work without a persisted JSONL file", async (
     inner: { sessionManager },
     sessionFile: sessionManager.getSessionFile(),
     sessionId: runtimeId,
+    syncSessionIdentity: () => {},
     cwd: "/tmp",
     send: async () => ({ isStreaming: true }),
   }]]);

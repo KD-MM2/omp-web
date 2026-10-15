@@ -497,6 +497,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
+  const followSessionIdentity = useCallback((nextId: string) => {
+    if (nextId === sessionIdRef.current) return;
+    // Async sends awaiting the SSE handshake must use the new ID immediately;
+    // waiting for the parent to remount leaves captured IDs pointing at history.
+    sessionIdRef.current = nextId;
+    eventSourceSessionIdRef.current = nextId;
+    onSessionForked?.(nextId);
+  }, [onSessionForked]);
+
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
     let messagesLoaded = false;
     try {
@@ -516,7 +525,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const d = await res.json() as SessionData;
       if (sessionIdRef.current !== sid) return null;
       if (d.sessionId !== sid && onSessionForked) {
-        onSessionForked(d.sessionId);
+        followSessionIdentity(d.sessionId);
         return null;
       }
       setData(d);
@@ -565,7 +574,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
     }
-  }, [onSessionForked]);
+  }, [followSessionIdentity, onSessionForked]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     try {
@@ -1110,7 +1119,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         || promptRunIdRef.current !== runId
       ) return;
       if (data.state?.sessionId && data.state.sessionId !== sid && onSessionForked) {
-        onSessionForked(data.state.sessionId);
+        followSessionIdentity(data.state.sessionId);
         return;
       }
       if (data.state?.model && !modelSwitchPendingRef.current) {
@@ -1120,7 +1129,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch {
       // The next refresh retries; state reconciliation owns error recovery.
     }
-  }, [onSessionForked]);
+  }, [followSessionIdentity, onSessionForked]);
 
   // Context usage changes after each model/tool turn, not only when the prompt
   // settles. Poll the lightweight state endpoint while the session is active
@@ -1167,6 +1176,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
+      case "connected":
+      case "session_changed":
+        if (typeof event.sessionId === "string" && event.sessionId !== sessionIdRef.current) {
+          followSessionIdentity(event.sessionId);
+        }
+        break;
       case "agent_start":
         cancelEventStreamGrace();
         sdkAgentActiveRef.current = true;
@@ -1436,7 +1451,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, refreshContextUsage, scheduleEventStreamClose, settleUiStage]);
+  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, followSessionIdentity, refreshContextUsage, scheduleEventStreamClose, settleUiStage]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
@@ -1493,9 +1508,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
             }
           }
-          await ensureEventsConnected(sid);
+          await ensureEventsConnected(sessionIdRef.current ?? sid);
+          sentSessionId = sessionIdRef.current ?? sid;
           promptRequestStarted = true;
-          await sendAgentCommand(sid, {
+          await sendAgentCommand(sentSessionId, {
             type: "prompt",
             message,
             ...(piImages?.length ? { images: piImages } : {}),
@@ -1503,10 +1519,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           promoteNewSession(1, message);
         }
       } else if (session) {
-        sentSessionId = session.id;
-        await ensureEventsConnected(session.id);
+        await ensureEventsConnected(sessionIdRef.current ?? session.id);
+        sentSessionId = sessionIdRef.current ?? session.id;
         promptRequestStarted = true;
-        await sendAgentCommand(session.id, {
+        await sendAgentCommand(sentSessionId, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
@@ -1890,8 +1906,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setAgentRunning(true);
           setAgentPhase({ kind: "running_command" });
           try {
-            await ensureEventsConnected(sid);
-            const result = await sendAgentCommand<{ cancelled?: boolean }>(sid, {
+            await ensureEventsConnected(sessionIdRef.current ?? sid);
+            const currentSid = sessionIdRef.current ?? sid;
+            const result = await sendAgentCommand<{ cancelled?: boolean }>(currentSid, {
               type: "handoff",
               ...(args ? { customInstructions: args } : {}),
             });
@@ -1901,7 +1918,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             // omp 18 hands off in place, so the session keeps its id and gains
             // a handoff compaction entry: reload this transcript rather than
             // navigating to a replacement session.
-            if (await loadSession(sid, true)) promoteNewSession();
+            if (await loadSession(currentSid, true)) promoteNewSession();
             return complete({ handled: true, message: "Context handed off and compacted in place" });
           } finally {
             agentRunningRef.current = false;
