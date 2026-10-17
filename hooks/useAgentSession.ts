@@ -546,8 +546,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return true;
   };
 
-  const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string) => {
-    if (!mountedRef.current || sessionIdRef.current !== requestedId) return true;
+  const followRuntimeState = useCallback((state: AgentStateResponse | undefined, requestedId: string, requestedRuntimeId: string | null) => {
+    // A response from an expired handle can arrive after another request has
+    // installed its replacement for the same transcript. Drop all stale state,
+    // including idle flags, rather than clearing or settling that newer runtime.
+    if (!mountedRef.current || sessionIdRef.current !== requestedId
+      || runtimeIdRef.current !== requestedRuntimeId) return true;
     if (state?.sessionId) {
       followSessionIdentity(state.sessionId, state.runtimeId ?? null);
     }
@@ -593,15 +597,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!includeState) return null;
 
       try {
-        const stateRes = await fetch(runtimeIdRef.current
-          ? `/api/agent/${encodeURIComponent(runtimeIdRef.current)}`
+        const requestedRuntimeId = runtimeIdRef.current;
+        const stateRes = await fetch(requestedRuntimeId
+          ? `/api/agent/${encodeURIComponent(requestedRuntimeId)}`
           : `/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
         if (!mountedRef.current || sessionIdRef.current !== sid) return null;
 
         const liveState = agentState.state;
-        if (followRuntimeState(liveState, sid)) return agentState;
+        if (followRuntimeState(liveState, sid, requestedRuntimeId)) return null;
         if (!agentState.running && liveState?.sessionId) runtimeIdRef.current = null;
         if (liveState) {
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
@@ -847,12 +852,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const ensureEventsConnected = useCallback(async (sid: string) => {
     if (!mountedRef.current) throw new Error("Session is no longer active");
-    if (runtimeIdRef.current) {
-      const stateRes = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current)}`);
+    const requestedRuntimeId = runtimeIdRef.current;
+    if (requestedRuntimeId) {
+      const stateRes = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId)}`);
       if (stateRes.ok) {
         const state = await stateRes.json() as { running?: boolean; state?: AgentStateResponse };
-        if (followRuntimeState(state.state, sid)) throw new Error("Session is no longer active");
-        if (!state.running) {
+        if (!mountedRef.current || sessionIdRef.current !== sid) throw new Error("Session is no longer active");
+        const stale = followRuntimeState(state.state, sid, requestedRuntimeId);
+        if (!stale && !state.running) {
           if (!state.state?.sessionId) throw new Error("Runtime identity expired; reopen the intended session");
           runtimeIdRef.current = null;
         }
@@ -1025,7 +1032,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ) return;
 
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`);
+        const requestedRuntimeId = runtimeIdRef.current;
+        const res = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
         if (
@@ -1035,7 +1043,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         ) return;
 
         const state = data.state;
-        if (followRuntimeState(state, sid)) return;
+        if (followRuntimeState(state, sid, requestedRuntimeId)) {
+          if (mountedRef.current) {
+            eventStreamGraceTimerRef.current = setTimeout(() => void checkServerIdle(), PROMPT_SETTLE_POLL_MS);
+          }
+          return;
+        }
         sid = sessionIdRef.current ?? sid;
         setSubagents((current) => mergeSubagentSnapshots(current, state?.subagents ?? []));
         const promptActive = Boolean(
@@ -1114,13 +1127,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const startedAt = Date.now();
 
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
+      if (!mountedRef.current || sessionIdRef.current !== sid) return;
       if (runId !== undefined && promptRunIdRef.current !== runId) return;
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`);
+        const requestedRuntimeId = runtimeIdRef.current;
+        const res = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`);
         if (res.ok) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+          if (runId !== undefined && promptRunIdRef.current !== runId) return;
           const state = data.state;
-          if (followRuntimeState(state, sid)) return;
+          if (followRuntimeState(state, sid, requestedRuntimeId)) {
+            await delay(PROMPT_SETTLE_POLL_MS);
+            continue;
+          }
           sid = sessionIdRef.current ?? sid;
           if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
             await finishPromptWithoutStream(sid, runId);
@@ -1139,16 +1158,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     bashRecoveryIdRef.current = recoveryId;
 
     while (
-      bashRunningRef.current
+      mountedRef.current
+      && bashRunningRef.current
       && bashRecoveryIdRef.current === recoveryId
       && sessionIdRef.current === sid
     ) {
       await delay(BASH_STATE_RECONCILE_MS);
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`);
+        const requestedRuntimeId = runtimeIdRef.current;
+        const res = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`);
         if (!res.ok) continue;
         const data = await res.json() as { state?: AgentStateResponse };
-        if (followRuntimeState(data.state, sid)) return;
+        if (bashRecoveryIdRef.current !== recoveryId) return;
+        if (followRuntimeState(data.state, sid, requestedRuntimeId)) continue;
         sid = sessionIdRef.current ?? sid;
         if (data.state?.isBashRunning) continue;
 
@@ -1173,7 +1195,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!agentRunningRef.current) return;
     const runId = promptRunIdRef.current;
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`);
+      const requestedRuntimeId = runtimeIdRef.current;
+      const res = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`);
       if (!res.ok) return;
       const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
       // A slow response can straddle a run boundary (previous run finished
@@ -1181,7 +1204,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // flight) — everything in it is stale, drop it.
       if (promptRunIdRef.current !== runId) return;
       const state = data.state;
-      if (followRuntimeState(state, sid)) return;
+      if (followRuntimeState(state, sid, requestedRuntimeId)) return;
       sid = sessionIdRef.current ?? sid;
       // Mirror compaction state unconditionally: a missed compaction_end
       // would otherwise leave the "Stop compaction" UI stuck. No state
@@ -1207,7 +1230,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const requestId = contextUsageRequestIdRef.current + 1;
     contextUsageRequestIdRef.current = requestId;
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`);
+      const requestedRuntimeId = runtimeIdRef.current;
+      const res = await fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`);
       if (!res.ok) return;
       const data = await res.json() as { state?: AgentStateResponse };
       if (
@@ -1215,7 +1239,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         || sessionIdRef.current !== sid
         || promptRunIdRef.current !== runId
       ) return;
-      if (followRuntimeState(data.state, sid)) return;
+      if (followRuntimeState(data.state, sid, requestedRuntimeId)) return;
       if (data.state?.model && !modelSwitchPendingRef.current) {
         setCurrentModelOverride({ provider: data.state.model.provider, modelId: data.state.model.id });
       }
@@ -1295,10 +1319,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (sessionIdRef.current) {
           const sid = sessionIdRef.current;
           loadSession(sid);
-          fetch(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}`)
+          const requestedRuntimeId = runtimeIdRef.current;
+          fetch(`/api/agent/${encodeURIComponent(requestedRuntimeId ?? sid)}`)
             .then((r) => r.json())
             .then((d: { state?: AgentStateResponse }) => {
-              if (followRuntimeState(d.state, sid)) return;
+              if (followRuntimeState(d.state, sid, requestedRuntimeId)) return;
               if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);

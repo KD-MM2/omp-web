@@ -736,7 +736,7 @@ export function AppShell() {
   const handleViewFullHistory = useCallback(() => {
     if (!selectedSession) return;
     window.open(
-      `/api/sessions/${encodeURIComponent(selectedSession.id)}/export?inline=1`,
+      `/api/sessions/${encodeURIComponent(selectedSession.runtimeId ?? selectedSession.id)}/export?inline=1`,
       "_blank",
       "noopener,noreferrer",
     );
