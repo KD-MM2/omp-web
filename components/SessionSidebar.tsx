@@ -635,6 +635,9 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
       : selectedSessionId;
     const completedInBackground = [...previous].flatMap((id) => {
       const runtimeId = previousRuntimeIds.get(id);
+      // A server restart can erase the current mapping before the sidebar sees
+      // a relocation. The previous snapshot still identifies the selected run.
+      if (runtimeId && runtimeId === selectedRuntimeId) return [];
       const currentId = (runtimeId && activitySnapshot.sessionIdsByRuntimeId?.[runtimeId]) || id;
       return !runningSessionIds.has(currentId) && currentId !== selectedCanonicalId
         ? [currentId] : [];
