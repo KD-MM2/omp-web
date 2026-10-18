@@ -213,6 +213,8 @@ type EventStreamConnectionAttempt = {
   source: EventSource;
   promise: Promise<EventStreamConnectionResult>;
   pending: boolean;
+  connected: boolean;
+  cancel: () => void;
 };
 
 class EventStreamConnectionError extends Error {
@@ -422,6 +424,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventSourceSessionIdRef = useRef<string | null>(null);
+  const eventSourceRuntimeIdRef = useRef<string | null>(null);
   const eventConnectionAttemptRef = useRef<EventStreamConnectionAttempt | null>(null);
   const eventStreamGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const eventStreamGraceGenerationRef = useRef(0);
@@ -515,10 +518,26 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
+  const closeEvents = useCallback(() => {
+    const source = eventSourceRef.current;
+    const attempt = eventConnectionAttemptRef.current;
+    eventSourceRef.current = null;
+    eventSourceSessionIdRef.current = null;
+    eventSourceRuntimeIdRef.current = null;
+    eventConnectionAttemptRef.current = null;
+    attempt?.cancel();
+    source?.close();
+  }, []);
+
   const followSessionIdentity = useCallback((nextId: string, runtimeId?: string | null) => {
     if (!mountedRef.current) return;
     const previousRuntimeId = runtimeIdRef.current;
     const handleChanged = runtimeId !== undefined && runtimeId !== previousRuntimeId;
+    // A source belongs to one live wrapper, not merely its transcript ID. An
+    // expired wrapper can keep heartbeating, so OPEN alone cannot prove reuse is
+    // safe. Same-runtime relocations retain their source and pending handshake.
+    if (runtimeId !== undefined && eventSourceRef.current
+      && eventSourceRuntimeIdRef.current !== runtimeId) closeEvents();
     if (runtimeId !== undefined) runtimeIdRef.current = runtimeId;
     if (runtimeId === null && previousRuntimeId) clearSessionContinuation(undefined, previousRuntimeId);
     if (runtimeIdRef.current) rememberSessionContinuation(nextId, runtimeIdRef.current);
@@ -534,9 +553,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     contextRequestRef.current += 1;
     identityDraftKeyRef.current = nextId;
     sessionIdRef.current = nextId;
-    eventSourceSessionIdRef.current = nextId;
+    if (eventSourceRef.current) eventSourceSessionIdRef.current = nextId;
     onSessionForked?.(nextId, runtimeId === null ? null : runtimeIdRef.current ?? undefined);
-  }, [onSessionForked, opts.chatInputRef]);
+  }, [closeEvents, onSessionForked, opts.chatInputRef]);
 
   runtimeIdRef.onIdentity = (identity, request) => {
     if (!mountedRef.current || !sessionIdRef.current) return false;
@@ -637,11 +656,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     const requestId = ++contextRequestRef.current;
-    const ownsContext = () => mountedRef.current && sessionIdRef.current === sid && contextRequestRef.current === requestId;
+    const requestedRuntimeId = runtimeIdRef.current;
+    const ownsContext = () => mountedRef.current && sessionIdRef.current === sid
+      && contextRequestRef.current === requestId && runtimeIdRef.current === requestedRuntimeId;
     try {
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
       if (leafId) params.set("leafId", leafId);
-      const url = `/api/sessions/${encodeURIComponent(runtimeIdRef.current ?? sid)}/context?${params}`;
+      const url = `/api/sessions/${encodeURIComponent(requestedRuntimeId ?? sid)}/context?${params}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as {
@@ -782,20 +803,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const closeEvents = useCallback(() => {
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
-    eventSourceSessionIdRef.current = null;
-    eventConnectionAttemptRef.current = null;
-  }, []);
-
   const connectEvents = useCallback((sid: string): Promise<EventStreamConnectionResult> => {
     if (!mountedRef.current) return Promise.reject(new Error("Session is no longer active"));
     closeEvents();
     const es = new EventSource(`/api/agent/${encodeURIComponent(runtimeIdRef.current ?? sid)}/events`);
     eventSourceRef.current = es;
     eventSourceSessionIdRef.current = sid;
+    eventSourceRuntimeIdRef.current = runtimeIdRef.current;
 
+    let cancel = () => {};
     const promise = new Promise<EventStreamConnectionResult>((resolve) => {
       let settled = false;
       const settle = (status: EventStreamConnectionStatus) => {
@@ -808,17 +824,29 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         resolve({ status, source: es });
       };
       const timeout = setTimeout(() => settle("timeout"), EVENT_STREAM_CONNECT_TIMEOUT_MS);
+      cancel = () => settle("closed");
 
       es.onmessage = (e) => {
+        if (!mountedRef.current || eventSourceRef.current !== es) return;
         try {
           const event = JSON.parse(e.data) as AgentEvent;
-          if (event.type === "connected") settle("connected");
+          // A canonical-ID connection may create a new runtime. Bind its first
+          // frame before following identity so we do not close that fresh source.
+          if (event.type === "connected" && typeof event.runtimeId === "string") {
+            eventSourceRuntimeIdRef.current = event.runtimeId;
+          }
+          if (event.type === "connected" && eventConnectionAttemptRef.current?.source === es) {
+            eventConnectionAttemptRef.current.connected = true;
+          }
           handleAgentEventRef.current?.(event);
+          if (event.type === "connected") settle("connected");
         } catch {
           // ignore
         }
       };
       es.onerror = () => {
+        if (!mountedRef.current || eventSourceRef.current !== es) return;
+        if (eventConnectionAttemptRef.current?.source === es) eventConnectionAttemptRef.current.connected = false;
         if (es.readyState === EventSource.CLOSED) {
           // Fatal error (404/500/content-type mismatch): browser won't
           // auto-reconnect. Settle the Promise and manually reconnect for
@@ -827,6 +855,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (eventSourceRef.current === es && (agentRunningRef.current || eventStreamGraceActiveRef.current)) {
             eventSourceRef.current = null;
             eventSourceSessionIdRef.current = null;
+            eventSourceRuntimeIdRef.current = null;
             eventConnectionAttemptRef.current = null;
             const reconnectGeneration = eventStreamGraceGenerationRef.current;
             setTimeout(() => {
@@ -846,7 +875,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // connection must be ready before they continue.
       };
     });
-    eventConnectionAttemptRef.current = { source: es, promise, pending: true };
+    eventConnectionAttemptRef.current = { source: es, promise, pending: true, connected: false, cancel };
     return promise;
   }, [closeEvents]);
 
@@ -868,13 +897,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     if (!mountedRef.current) throw new Error("Session is no longer active");
     const current = eventSourceRef.current;
-    if (current && eventSourceSessionIdRef.current === sid) {
-      if (current.readyState === EventSource.OPEN) return;
+    if (current && eventSourceSessionIdRef.current === sid
+      && eventSourceRuntimeIdRef.current === runtimeIdRef.current) {
       const attempt = eventConnectionAttemptRef.current;
       if (attempt?.source === current && attempt.pending) {
-        await attempt.promise;
+        const result = await attempt.promise;
         if (!mountedRef.current) throw new Error("Session is no longer active");
-        if (eventSourceRef.current === current && current.readyState === EventSource.OPEN) return;
+        if (result.status === "connected" && eventSourceRef.current === current
+          && eventSourceRuntimeIdRef.current === runtimeIdRef.current
+          && current.readyState === EventSource.OPEN) return;
+      } else if (attempt?.source === current && attempt.connected && current.readyState === EventSource.OPEN) {
+        return;
       }
     }
 
@@ -883,9 +916,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       result.source.close();
       throw new Error("Session is no longer active");
     }
-    if (result.status === "connected" || result.source.readyState === EventSource.OPEN) return;
+    if (result.status === "connected") return;
     if (eventSourceRef.current === result.source) eventSourceRef.current = null;
     if (eventSourceSessionIdRef.current === sid) eventSourceSessionIdRef.current = null;
+    eventSourceRuntimeIdRef.current = null;
     if (eventConnectionAttemptRef.current?.source === result.source) eventConnectionAttemptRef.current = null;
     result.source.close();
     throw new EventStreamConnectionError(result.status);
