@@ -537,7 +537,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // expired wrapper can keep heartbeating, so OPEN alone cannot prove reuse is
     // safe. Same-runtime relocations retain their source and pending handshake.
     if (runtimeId !== undefined && eventSourceRef.current
-      && eventSourceRuntimeIdRef.current !== runtimeId) closeEvents();
+      && eventSourceRuntimeIdRef.current !== runtimeId) {
+      const attempt = eventConnectionAttemptRef.current;
+      // State polling can discover a canonical connection's new wrapper before
+      // its first frame arrives. Adopt that expected binding without declaring
+      // the handshake ready; known/expired or unrelated sources still retire.
+      if (runtimeId !== null && previousRuntimeId === null && eventSourceRuntimeIdRef.current === null
+        && nextId === sessionIdRef.current && eventSourceSessionIdRef.current === nextId
+        && attempt?.source === eventSourceRef.current && attempt.pending) {
+        eventSourceRuntimeIdRef.current = runtimeId;
+      } else {
+        closeEvents();
+      }
+    }
     if (runtimeId !== undefined) runtimeIdRef.current = runtimeId;
     if (runtimeId === null && previousRuntimeId) clearSessionContinuation(undefined, previousRuntimeId);
     if (runtimeIdRef.current) rememberSessionContinuation(nextId, runtimeIdRef.current);
@@ -814,6 +826,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     let cancel = () => {};
     const promise = new Promise<EventStreamConnectionResult>((resolve) => {
       let settled = false;
+      let receivedConnected = false;
       const settle = (status: EventStreamConnectionStatus) => {
         if (settled) return;
         settled = true;
@@ -833,8 +846,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           // A canonical-ID connection may create a new runtime. Bind its first
           // frame before following identity so we do not close that fresh source.
           if (event.type === "connected" && typeof event.runtimeId === "string") {
+            // A poll may have adopted an expected runtime while this source was
+            // unbound. Reject a contradictory first frame, even after timeout,
+            // instead of rolling the selected runtime back to another wrapper.
+            const expectedRuntimeId = eventSourceRuntimeIdRef.current;
+            if (!receivedConnected && expectedRuntimeId !== null && event.runtimeId !== expectedRuntimeId) {
+              closeEvents();
+              return;
+            }
             eventSourceRuntimeIdRef.current = event.runtimeId;
           }
+          if (event.type === "connected") receivedConnected = true;
           if (event.type === "connected" && eventConnectionAttemptRef.current?.source === es) {
             eventConnectionAttemptRef.current.connected = true;
           }
