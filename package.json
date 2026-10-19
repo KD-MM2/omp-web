@@ -1,6 +1,6 @@
 {
   "name": "omp-web",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Web view for the omp (oh-my-pi) coding agent CLI",
   "homepage": "https://github.com/ddallabenetta/omp-web#readme",
   "repository": {
@@ -57,11 +57,11 @@
     "@oh-my-pi/pi-coding-agent": "~18.10.4",
     "@oh-my-pi/pi-tui": "~18.10.4",
     "@oh-my-pi/pi-utils": "~18.10.4",
-    "js-yaml": "^5.4.3",
+    "js-yaml": "^5.5.0",
     "next": "16.2.12",
     "proper-lockfile": "4.1.2",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "remark-frontmatter": "^5.0.0",
     "undici": "8.5.0",
     "yaml": "^2.9.1"
@@ -69,7 +69,7 @@
   "devDependencies": {
     "@lobehub/icons": "^5.23.1",
     "@tailwindcss/postcss": "^4.3.3",
-    "@tauri-apps/cli": "^2.12.2",
+    "@tauri-apps/cli": "^2.12.3",
     "@types/bun": "^1.4.3",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^25.9.9",
@@ -83,7 +83,7 @@
     "katex": "^0.16.47",
     "mammoth": "^1.13.0",
     "mermaid": "^11.17.2",
-    "postcss": "^8.5.30",
+    "postcss": "^8.5.31",
     "react-markdown": "^10.1.0",
     "react-syntax-highlighter": "^16.1.2",
     "rehype-katex": "^7.0.1",
