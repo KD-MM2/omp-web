@@ -74,6 +74,20 @@ const nextConfig: NextConfig = {
       // NEXT_RUNTIME. Webpack still traces it for the browser fallback unless
       // the server-only module is explicitly excluded.
       config.resolve.alias["@/lib/http-dispatcher"] = false;
+      // Next 16.3's `client-development-fallback` graph re-traces server
+      // modules for the browser, where `serverExternalPackages` does not apply
+      // and node_modules get no TS loader — the SDK's `export type *` sources
+      // then die in the raw parser ("Module parse failed"). The browser never
+      // executes the SDK, so keep it out of every client-side compile as an
+      // external that resolves to `undefined` if anything ever requires it.
+      const clientExternals = Array.isArray(config.externals) ? config.externals : [config.externals].filter(Boolean);
+      config.externals = [
+        ({ request }: { request?: string }, callback: (error?: unknown, result?: string) => void) => {
+          if (request && OMP_SDK_REQUEST.test(request)) return callback(undefined, "var void 0");
+          return callback();
+        },
+        ...clientExternals,
+      ];
       return config;
     }
     const externals = Array.isArray(config.externals) ? config.externals : [config.externals].filter(Boolean);
