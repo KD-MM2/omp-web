@@ -39,14 +39,14 @@ test("keeps the session event stream open through the idle grace window", () => 
 
   assert.match(source, /const EVENT_STREAM_IDLE_GRACE_MS = 30_000/);
   assert.match(graceSource, /setTimeout\(\(\) => void checkServerIdle\(\), EVENT_STREAM_IDLE_GRACE_MS\)/);
-  assert.match(graceSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(requestedRuntimeId \?\? sid\)\}`\)/);
+  assert.match(graceSource, /fetch\(agentStatusUrl\(requestedRuntimeId \?\? sid\)\)/);
   assert.match(graceSource, /closeEvents\(\)/);
   assert.match(finishSource, /scheduleEventStreamClose\(sid\)/);
   assert.doesNotMatch(finishSource, /closeEvents\(\)/);
   assert.doesNotMatch(agentEndSource, /closeEvents\(\)/);
   assert.match(agentStartSource, /cancelEventStreamGrace\(\)/);
   assert.match(agentSettledSource, /scheduleEventStreamClose\(sid\)/);
-  assert.match(agentSettledSource, /onAgentEnd\?\.\(sessionIdRef\.current \?\? undefined\)/);
+  assert.match(agentSettledSource, /onAgentEnd\?\.\(\{ aborted: "aborted" in event && event\.aborted === true, sessionId: sessionIdRef\.current \?\? undefined \}\)/);
   assert.match(promptDoneSource, /notifyPromptStage\(runId\)/);
   assert.match(promptDoneSource, /scheduleEventStreamClose\(sid\)/);
   assert.match(sendSource, /const definitivelyRejected = !promptRequestStarted \|\| isPromptRejectedError\(e\)/);
@@ -62,18 +62,18 @@ test("reuses an open event stream and hides an empty agent phase", () => {
 
   assert.match(ensureSource, /eventSourceSessionIdRef\.current === sid/);
   assert.match(ensureSource, /current\.readyState === EventSource\.OPEN/);
-  assert.match(ensureSource, /attempt\?\.source === current && attempt\.pending/);
-  assert.match(chatWindowSource, /agentRunning && !streamState\.streamingMessage && agentPhase/);
+  assert.match(chatWindowSource, /agentRunning && !hasStreamingContent && \(agentPhase \|\| isCompacting\)/);
   assert.match(chatWindowSource, /return null;/);
 });
 
-test("plays the enabled sound once for each extension dialog", () => {
-  assert.match(chatWindowSource, /soundedExtensionDialogIdRef = useRef<string \| null>\(null\)/);
+test("plays the enabled sound when an extension dialog surfaces", () => {
+  // Upstream semantics: one chime when a dialog appears with none on screen;
+  // one queued behind another stays quiet until it surfaces.
+  assert.match(chatWindowSource, /extensionDialogShownRef = useRef\(false\)/);
   assert.match(
     chatWindowSource,
-    /soundedExtensionDialogIdRef\.current === extensionDialog\.id/,
+    /const surfaced = Boolean\(extensionDialog\) && !extensionDialogShownRef\.current/,
   );
-  assert.match(chatWindowSource, /soundedExtensionDialogIdRef\.current = extensionDialog\.id/);
   assert.match(chatWindowSource, /playDoneSoundRef\.current\(\)/);
 });
 
@@ -235,8 +235,8 @@ test("exposes a paused-follow flag and a jump-to-bottom action", () => {
   // A new prompt or shell command resumes following.
   assert.doesNotMatch(source, /completionScrollAllowedRef\.current = true;/);
 
-  assert.match(chatWindowSource, /autoFollowPaused, resumeAutoFollow,/);
-  assert.match(chatWindowSource, /\{sessionBusy && autoFollowPaused && \(/);
+  assert.match(chatWindowSource, /resumeAutoFollow,/);
+  assert.match(chatWindowSource, /showScrollToBottom && !pendingScrollRestore/);
   assert.match(chatWindowSource, /onClick=\{resumeAutoFollow\}/);
 });
 
@@ -249,7 +249,6 @@ test("renders the transcript with omp's hideThinkingBlock setting", () => {
   assert.match(chatWindowSource, /displayOptions = useMemo<DisplayOptions>\(\(\) => \(\{ hideThinking: hideThinkingBlock \}\)/);
   // Turn grouping has to agree with what MessageView renders, or a message
   // made only of thinking blocks leaves an empty row behind.
-  assert.match(chatWindowSource, /hasDisplayableProcessMessage\(messages\[processIdx\], displayOptions\)/);
-  assert.match(chatWindowSource, /splitFinalAssistantBlocks\(finalAssistant, displayOptions\)/);
+  assert.match(chatWindowSource, /getDisplayableAssistantBlocks\(message, displayOptions\)/);
   assert.match(chatWindowSource, /findFinalAssistantIndex\(messages, userIdx, endIdx, displayOptions\)/);
 });

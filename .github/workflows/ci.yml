@@ -20,6 +20,7 @@ jobs:
   verify:
     name: Verify build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -39,8 +40,14 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Lint
+        run: bun run lint
+
       - name: Typecheck
         run: bun run typecheck
+
+      - name: Test
+        run: bun test
 
       - name: Build package
         run: bun run build

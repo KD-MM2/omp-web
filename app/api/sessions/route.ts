@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   attachSessionProjectInfo,
+  getSessionListVersion,
   listAllSessions,
   mergeSessionLists,
 } from "@/lib/session-reader";
@@ -18,10 +19,11 @@ export async function GET(req: Request) {
       attachSessionProjectInfo(getRpcSessionInfos()),
     ]);
     const archived = readArchivedIds();
+    const sessionListVersion = getSessionListVersion();
     const sessions = mergeSessionLists(persistedSessions, runtimeSessions)
       .filter((s) => (showArchived ? archived.has(s.id) : !archived.has(s.id)));
     return NextResponse.json(
-      { sessions, ...getRpcSessionActivitySnapshot() },
+      { sessions, sessionListVersion, ...getRpcSessionActivitySnapshot() },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {

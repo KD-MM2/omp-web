@@ -12,6 +12,11 @@ export async function GET(
   const leafId = url.searchParams.get("leafId") ?? undefined;
   const deferThinking = url.searchParams.has("deferThinking");
   const deferToolResultImages = url.searchParams.has("deferMedia");
+  // Page upward: `before` is the oldest entry already loaded, so the next page
+  // starts at its parent. `tail` bounds the visible window (routes cap at 1000).
+  const before = url.searchParams.get("before");
+  const rawTail = Number(url.searchParams.get("tail"));
+  const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : undefined;
 
   try {
     const directRpc = getRpcSession(id);
@@ -25,9 +30,11 @@ export async function GET(
 
     const sm = liveRpc?.inner.sessionManager ?? await SessionManager.open(filePath!);
     const entries = sm.getEntries() as never;
-    const context = buildSessionContext(entries, leafId, {
+    const context = buildSessionContext(entries, before ?? leafId, {
       deferThinking,
       deferToolResultImages,
+      tail,
+      excludeLeaf: Boolean(before),
     });
     const contextUsage = await getHistoricalContextUsage(entries, leafId);
 

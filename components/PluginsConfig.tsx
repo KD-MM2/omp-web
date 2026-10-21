@@ -1,17 +1,55 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand, type RuntimeSessionBinding } from "@/lib/agent-client";
-import { useIsMobile } from "@/hooks/useIsMobile";
-import type { PluginPackageInfo, PluginsResponse } from "@/lib/api-types";
+import type {
+  PluginPackageInfo,
+  PluginsResponse,
+  ProjectTrustStatus,
+} from "@/lib/api-types";
 import { useI18n } from "@/hooks/useI18n";
+import { shortenPath } from "@/lib/display-path";
+import {
+  getLastSettingsSelection,
+  setLastSettingsSelection,
+} from "@/lib/settings-navigation";
+import {
+  ConfigAddSourcePanel,
+  ConfigButton,
+  ConfigDetail,
+  ConfigDetailActions,
+  ConfigDetailGrid,
+  ConfigDetailGridRow,
+  ConfigDetailHeader,
+  ConfigDetailHeaderInfo,
+  ConfigDetailStack,
+  ConfigEmptyState,
+  ConfigFooter,
+  ConfigFooterStatus,
+  ConfigListAction,
+  ConfigPanelShell,
+  ConfigSaveTarget,
+  ConfigScopeTag,
+  ConfigSidebar,
+  ConfigSidebarGroupLabel,
+  ConfigSidebarGroupStatus,
+  ConfigSidebarGroupSwitch,
+  ConfigSidebarItem,
+  ConfigSidebarList,
+  ConfigSidebarText,
+  ConfigSectionTitle,
+  ConfigSplitView,
+  ConfigStatusDot,
+  ConfigSwitch,
+  ConfigTrustNotice,
+} from "./SettingsUi";
+import { itemsToSwitch, projectTrustReloadKey } from "./settings-ui-helpers";
 
 type PluginScope = PluginPackageInfo["scope"];
 type PluginAction = "install" | "remove" | "update" | "disable" | "enable";
+type Translate = ReturnType<typeof useI18n>["t"];
 
-function shortenPath(path: string): string {
-  return path.replace(/^\/(?:Users|home)\/[^/]+/, "~");
-}
+const PLUGIN_SOURCE_EXAMPLES = ["@scope/omp-plugin", "github:user/repo", "pkg[feature]"];
 
 function normalizePluginSourceInput(value: string): string {
   const match = value.trim().match(/^\$?\s*omp\s+plugin\s+(?:add|install)\s+(\S+)\s*$/);
@@ -22,7 +60,50 @@ function packageKey(pkg: Pick<PluginPackageInfo, "source" | "scope">): string {
   return `${pkg.scope}\0${pkg.source}`;
 }
 
-function resourceSummary(pkg: PluginPackageInfo, t: ReturnType<typeof useI18n>["t"]): string {
+/**
+ * The packages a scope's group switch would change: those not already in the
+ * requested state. Switching a group off also leaves out a filtered package:
+ * disabling empties its resource lists and nothing keeps the filters, so that
+ * stays a decision for its own switch.
+ */
+export function packagesToSwitch<T extends Pick<PluginPackageInfo, "disabled" | "filtered">>(
+  packages: T[],
+  enabled: boolean,
+): T[] {
+  return itemsToSwitch(packages, enabled, (pkg) => !pkg.disabled, (pkg) => pkg.filtered);
+}
+
+/** Enabled filtered packages, which switching their group off leaves on. */
+export function filteredPackagesKeptOn<T extends Pick<PluginPackageInfo, "disabled" | "filtered">>(
+  packages: T[],
+): T[] {
+  return packages.filter((pkg) => !pkg.disabled && pkg.filtered);
+}
+
+function scopeLabel(scope: PluginScope, t: Translate): string {
+  return scope === "project" ? t("skills.scope.project") : t("skills.scope.global");
+}
+
+/** A package status as shown; English keeps the lower-case API value. */
+function statusLabel(status: PluginPackageInfo["status"], t: Translate): string {
+  return t(`plugins.status.${status}`);
+}
+
+/** The footer's resource totals, in the order of a package's resource summary. */
+function totalsSummary(totals: PluginsResponse["totals"], t: Translate): string {
+  return [
+    t("i18n.resourceCount", { count: totals.extensions, label: t("i18n.extensionShort") }),
+    t("i18n.resourceCount", { count: totals.skills, label: t("i18n.skillShort") }),
+    t("i18n.resourceCount", { count: totals.prompts, label: t("i18n.promptShort") }),
+    t("i18n.resourceCount", { count: totals.themes, label: t("i18n.themeShort") }),
+  ].join(" · ");
+}
+
+function diagnosticText(diagnostic: PluginsResponse["diagnostics"][number]): string {
+  return `${diagnostic.type}: ${diagnostic.source ? `${diagnostic.source}: ` : ""}${diagnostic.message}`;
+}
+
+function resourceSummary(pkg: PluginPackageInfo, t: Translate): string {
   if (pkg.disabled) return t("i18n.disabled");
   const parts = [
     pkg.counts.extensions ? t("i18n.resourceCount", { count: pkg.counts.extensions, label: t("i18n.extensionShort") }) : "",
@@ -33,13 +114,14 @@ function resourceSummary(pkg: PluginPackageInfo, t: ReturnType<typeof useI18n>["
   return parts.length ? parts.join(" · ") : t("i18n.noResources");
 }
 
-function versionSummary(pkg: PluginPackageInfo, t: ReturnType<typeof useI18n>["t"]): string {
+function versionSummary(pkg: PluginPackageInfo, t: Translate): string {
   const parts = [];
   if (pkg.version) parts.push(t("i18n.installedVersion", { version: pkg.version }));
   if (pkg.configuredVersion) parts.push(t("i18n.configuredVersion", { version: pkg.configuredVersion }));
   return parts.length ? parts.join(" · ") : t("i18n.unknown");
 }
 
+/** Where omp installs a package of this scope. */
 function installLocation(scope: PluginScope, cwd: string): string {
   return scope === "project"
     ? `${shortenPath(cwd)}/.omp/plugins`
@@ -154,137 +236,6 @@ function ResourceList({ pkg }: { pkg: PluginPackageInfo }) {
   );
 }
 
-function ScopeTag({ scope }: { scope: PluginScope }) {
-  return (
-    <span
-      style={{
-        fontSize: 10,
-        padding: "1px 5px",
-        borderRadius: 3,
-        flexShrink: 0,
-        background: scope === "project" ? "rgba(99,102,241,0.12)" : "rgba(120,120,120,0.12)",
-        color: scope === "project" ? "rgba(99,102,241,0.85)" : "var(--text-dim)",
-      }}
-    >
-      {scope}
-    </span>
-  );
-}
-
-function buttonStyle(disabled?: boolean, danger?: boolean): React.CSSProperties {
-  return {
-    padding: "6px 12px",
-    background: danger ? "rgba(239,68,68,0.08)" : "none",
-    border: "1px solid var(--border)",
-    borderRadius: 6,
-    color: danger ? "#ef4444" : "var(--text-muted)",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontSize: 12,
-    opacity: disabled ? 0.5 : 1,
-  };
-}
-
-function Toggle({
-  enabled,
-  loading,
-  onToggle,
-  label,
-}: {
-  enabled: boolean;
-  loading: boolean;
-  onToggle: () => void;
-  label: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      disabled={loading}
-      title={label}
-      aria-label={label}
-      aria-pressed={enabled}
-      style={{
-        flexShrink: 0,
-        width: 40,
-        height: 22,
-        borderRadius: 11,
-        border: "none",
-        padding: 0,
-        cursor: loading ? "wait" : "pointer",
-        background: enabled ? "var(--accent)" : "var(--border)",
-        position: "relative",
-        transition: "background 0.18s",
-        outline: "none",
-        opacity: loading ? 0.65 : 1,
-      }}
-    >
-      <span
-        style={{
-          position: "absolute",
-          top: 3,
-          left: enabled ? 21 : 3,
-          width: 16,
-          height: 16,
-          borderRadius: "50%",
-          background: "var(--bg)",
-          boxShadow: "0 1px 4px rgba(0,0,0,0.22)",
-          transition: "left 0.18s cubic-bezier(.4,0,.2,1)",
-        }}
-      />
-    </button>
-  );
-}
-
-function SegmentedScope({
-  value,
-  projectResourcesLoaded,
-  onChange,
-}: {
-  value: PluginScope;
-  projectResourcesLoaded: boolean;
-  onChange: (scope: PluginScope) => void;
-}) {
-  const { t } = useI18n();
-  return (
-    <div
-      style={{
-        display: "inline-flex",
-        border: "1px solid var(--border)",
-        borderRadius: 7,
-        overflow: "hidden",
-        height: 30,
-      }}
-    >
-      {(["global", "project"] as PluginScope[]).map((scope) => {
-        const active = value === scope;
-        const disabled = scope === "project" && !projectResourcesLoaded;
-        return (
-          <button
-            key={scope}
-            onClick={() => {
-              if (!disabled) onChange(scope);
-            }}
-            disabled={disabled}
-            title={disabled ? t("trust.projectScopeUnavailable") : undefined}
-            style={{
-              width: 76,
-              border: "none",
-              borderRight: scope === "global" ? "1px solid var(--border)" : "none",
-              background: active ? "var(--bg-selected)" : "none",
-              color: active ? "var(--text)" : "var(--text-muted)",
-              cursor: disabled ? "not-allowed" : "pointer",
-              opacity: disabled ? 0.45 : 1,
-              fontSize: 12,
-            }}
-          >
-            {scope}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
 function AddPluginPanel({
   cwd,
   source,
@@ -307,151 +258,58 @@ function AddPluginPanel({
   onInstall: () => void;
 }) {
   const { t } = useI18n();
-  const inputRef = useRef<HTMLInputElement>(null);
-  const examples = ["@scope/omp-plugin", "github:user/repo", "pkg[feature]"];
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 660, minHeight: "100%" }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>
-            {t("i18n.addPlugin")}
-          </div>
-          <a
-            href="https://github.com/can1357/oh-my-pi#plugins"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 5,
-              color: "var(--accent)",
-              fontSize: 12,
-              textDecoration: "none",
-              whiteSpace: "nowrap",
-            }}
-          >
-            <svg width="28" height="28" viewBox="0 0 800 800" aria-hidden="true" focusable="false" style={{ flexShrink: 0 }}>
-              <path
-                fill="#000"
-                fillRule="evenodd"
-                d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-              />
-              <path fill="#000" d="M517.36 400H634.72V634.72H517.36Z" />
-            </svg>
-            oh-my-pi plugins
-          </a>
-        </div>
-        <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
-          {installLocation(scope, cwd)}
-        </div>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        <label htmlFor="plugin-source" style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>
-          Source
-        </label>
-        <input
-          id="plugin-source"
-          ref={inputRef}
-          value={source}
-          onChange={(e) => onSourceChange(e.target.value)}
-          onPaste={(e) => {
-            const pasted = e.clipboardData.getData("text");
-            const normalized = normalizePluginSourceInput(pasted);
-            if (normalized === pasted) return;
-            e.preventDefault();
-            onSourceChange(normalized);
-          }}
-          onBlur={(e) => onSourceChange(normalizePluginSourceInput(e.currentTarget.value))}
-          placeholder="@scope/package or github:user/repo"
-          style={{
-            width: "100%",
-            height: 36,
-            padding: "0 11px",
-            border: "1px solid var(--border)",
-            borderRadius: 6,
-            background: "var(--bg-panel)",
-            color: "var(--text)",
-            fontFamily: "var(--font-mono)",
-            fontSize: 13,
-            outline: "none",
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && source.trim() && !busy) onInstall();
-          }}
-        />
-      </div>
-
-      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <SegmentedScope
+    <ConfigAddSourcePanel
+      title={t("i18n.addPlugin")}
+      catalogs={[{
+        href: "https://github.com/can1357/oh-my-pi#plugins",
+        label: "oh-my-pi plugins",
+        icon: (
+          <svg width="28" height="28" viewBox="0 0 800 800" aria-hidden="true" focusable="false">
+            <path
+              fill="#000"
+              fillRule="evenodd"
+              d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
+            />
+            <path fill="#000" d="M517.36 400H634.72V634.72H517.36Z" />
+          </svg>
+        ),
+      }]}
+      target={
+        <ConfigSaveTarget
           value={scope}
-          projectResourcesLoaded={projectResourcesLoaded}
+          label={t("config.saveTo")}
+          options={[
+            { value: "global", label: scopeLabel("global", t) },
+            { value: "project", label: scopeLabel("project", t), disabled: !projectResourcesLoaded },
+          ]}
+          path={installLocation(scope, cwd)}
+          disabledReason={t("trust.projectScopeUnavailable")}
           onChange={onScopeChange}
         />
-        <button
-          type="button"
-          onClick={onInstall}
-          disabled={busy || !source.trim()}
-          style={{
-            ...buttonStyle(busy || !source.trim()),
-            background: "var(--accent)",
-            color: "white",
-            borderColor: "var(--accent)",
-          }}
-        >
-          {busy ? t("i18n.installing") : t("i18n.install")}
-        </button>
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>
-          Examples
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {examples.map((example) => (
-            <button
-              key={example}
-              type="button"
-              onClick={() => onSourceChange(example)}
-              style={{
-                width: "100%",
-                minHeight: 30,
-                textAlign: "left",
-                padding: "6px 9px",
-                border: "1px solid var(--border)",
-                borderRadius: 6,
-                background: "var(--bg-panel)",
-                color: "var(--text-dim)",
-                cursor: "pointer",
-                fontFamily: "var(--font-mono)",
-                fontSize: 11,
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.background = "var(--bg-hover)";
-                e.currentTarget.style.color = "var(--text-muted)";
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.background = "var(--bg-panel)";
-                e.currentTarget.style.color = "var(--text-dim)";
-              }}
-            >
-              {example}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {actionError && (
-        <div style={{ fontSize: 12, color: "#ef4444", whiteSpace: "pre-wrap" }}>
-          {actionError}
-        </div>
-      )}
-    </div>
+      }
+      inputLabel={t("config.source")}
+      inputId="plugin-source"
+      placeholder="npm:@scope/package"
+      value={source}
+      canSubmit={!busy && Boolean(source.trim())}
+      normalizeValue={normalizePluginSourceInput}
+      onValueChange={onSourceChange}
+      onSubmit={onInstall}
+      examplesLabel={t("config.examples")}
+      examples={PLUGIN_SOURCE_EXAMPLES}
+      error={actionError}
+    >
+      <ConfigButton
+        variant="primary"
+        onClick={onInstall}
+        disabled={busy || !source.trim()}
+        className="is-pushed-right"
+      >
+        {busy ? t("i18n.installing") : t("i18n.install")}
+      </ConfigButton>
+    </ConfigAddSourcePanel>
   );
 }
 
@@ -476,125 +334,122 @@ function PackageDetail({
 }) {
   const { t } = useI18n();
   const key = packageKey(pkg);
-  const busy = busyKey?.endsWith(key) ?? false;
+  const busy = (busyKey?.endsWith(key) || busyKey?.startsWith("bulk:")) ?? false;
   const reloadBusy = busyKey === "reload";
   const enabled = !pkg.disabled;
+  const reloadReasonId = useId();
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20, maxWidth: 680 }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, minWidth: 0, flexWrap: "wrap" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 180, flex: 1 }}>
-          <Toggle
-            enabled={enabled}
-            loading={busy || reloadBusy}
-            onToggle={() => onAction(pkg.disabled ? "enable" : "disable", pkg)}
-            label={pkg.disabled ? t("i18n.enablePackage") : t("i18n.disablePackage")}
-          />
-          <ScopeTag scope={pkg.scope} />
-          {pkg.disabled ? (
+    <ConfigDetailStack>
+      <div className="config-detail-heading">
+        <ConfigDetailHeader className="is-top-aligned">
+          <ConfigDetailHeaderInfo>
+            <ConfigScopeTag scope={pkg.scope}>{scopeLabel(pkg.scope, t)}</ConfigScopeTag>
+            {pkg.disabled ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: "1px 5px",
+                  borderRadius: 3,
+                  background: "rgba(120,120,120,0.12)",
+                  color: "var(--text-dim)",
+                }}
+              >
+                {t("i18n.disabled")}
+              </span>
+            ) : pkg.filtered && (
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: "1px 5px",
+                  borderRadius: 3,
+                  background: "rgba(245,158,11,0.12)",
+                  color: "#d97706",
+                }}
+              >
+                {t("i18n.filtered")}
+              </span>
+            )}
             <span
               style={{
-                fontSize: 10,
-                padding: "1px 5px",
-                borderRadius: 3,
-                background: "rgba(120,120,120,0.12)",
-                color: "var(--text-dim)",
+                fontFamily: "var(--font-mono)",
+                fontSize: 12,
+                color: "var(--text)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
               }}
             >
-              {t("i18n.disabled")}
+              {pkg.source}
             </span>
-          ) : pkg.filtered && (
-            <span
-              style={{
-                fontSize: 10,
-                padding: "1px 5px",
-                borderRadius: 3,
-                background: "rgba(245,158,11,0.12)",
-                color: "#d97706",
-              }}
-            >
-              {t("i18n.filtered")}
-            </span>
-          )}
-          <span
-            style={{
-              fontFamily: "var(--font-mono)",
-              fontSize: 12,
-              color: "var(--text)",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {pkg.source}
-          </span>
-        </div>
+          </ConfigDetailHeaderInfo>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button
-            onClick={() => onAction("update", pkg)}
-            disabled={busy || reloadBusy}
-            style={buttonStyle(busy || reloadBusy)}
-          >
-             {busyKey === `update:${key}` ? t("i18n.updating") : t("i18n.update")}
-          </button>
-          <button
-            onClick={onReloadSession}
-            disabled={!sessionId || reloadBusy || busy}
-            style={buttonStyle(!sessionId || reloadBusy || busy)}
-             title={sessionId ? t("i18n.reloadSession") : t("i18n.openSessionToReload")}
-          >
-             {reloadBusy ? t("i18n.reloading") : t("i18n.reloadSession")}
-          </button>
-          <button
-            onClick={() => onAction("remove", pkg)}
-            disabled={busy || reloadBusy}
-            style={buttonStyle(busy || reloadBusy, true)}
-          >
-             {busyKey === `remove:${key}` ? t("i18n.removing") : t("i18n.remove")}
-          </button>
-        </div>
+          <ConfigDetailActions>
+            <ConfigButton
+              size="small"
+              onClick={() => onAction("update", pkg)}
+              disabled={busy || reloadBusy}
+            >
+               {busyKey === `update:${key}` ? t("i18n.updating") : t("i18n.update")}
+            </ConfigButton>
+            <ConfigButton
+              size="small"
+              onClick={onReloadSession}
+              disabled={!sessionId || reloadBusy || busy}
+              aria-describedby={sessionId ? undefined : reloadReasonId}
+            >
+               {reloadBusy ? t("i18n.reloading") : t("i18n.reloadSession")}
+            </ConfigButton>
+            <ConfigButton
+              variant="danger"
+              size="small"
+              onClick={() => onAction("remove", pkg)}
+              disabled={busy || reloadBusy}
+            >
+               {busyKey === `remove:${key}` ? t("i18n.removing") : t("i18n.remove")}
+            </ConfigButton>
+            <ConfigSwitch
+              checked={enabled}
+              loading={busy || reloadBusy}
+              onChange={() => onAction(pkg.disabled ? "enable" : "disable", pkg)}
+              label={pkg.disabled ? t("i18n.enablePackage") : t("i18n.disablePackage")}
+            />
+          </ConfigDetailActions>
+        </ConfigDetailHeader>
+        {!sessionId && (
+          <div id={reloadReasonId} className="config-detail-heading-note">
+            {t("i18n.openSessionToReload")}
+          </div>
+        )}
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(96px, 130px) minmax(0, 1fr)",
-          gap: "9px 14px",
-          fontSize: 12,
-          lineHeight: 1.45,
-        }}
-      >
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.status")}</div>
-        <div style={{ color: statusColor(pkg.status), textTransform: "capitalize" }}>{pkg.status}</div>
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.version")}</div>
-         <div style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{versionSummary(pkg, t)}</div>
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.package")}</div>
-        <div style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
-          {pkg.packageName ?? t("i18n.unknown")}
-        </div>
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.resources")}</div>
-         <div style={{ color: "var(--text-muted)" }}>{resourceSummary(pkg, t)}</div>
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.installedPath")}</div>
-        <div
-          style={{
-            color: pkg.installedPath ? "var(--text-muted)" : "#ef4444",
-            fontFamily: "var(--font-mono)",
-            overflowWrap: "anywhere",
-          }}
+      <ConfigDetailGrid>
+        <ConfigDetailGridRow
+          label={t("i18n.status")}
+          tone="plain"
+          style={{ color: statusColor(pkg.status), textTransform: "capitalize" }}
         >
+          {statusLabel(pkg.status, t)}
+        </ConfigDetailGridRow>
+        <ConfigDetailGridRow label={t("i18n.version")} tone="plain">
+          {versionSummary(pkg, t)}
+        </ConfigDetailGridRow>
+        <ConfigDetailGridRow label={t("i18n.package")} mono>
+          {pkg.packageName ?? t("i18n.unknown")}
+        </ConfigDetailGridRow>
+        <ConfigDetailGridRow label={t("i18n.resources")}>
+          {resourceSummary(pkg, t)}
+        </ConfigDetailGridRow>
+        <ConfigDetailGridRow label={t("i18n.installedPath")} tone={pkg.installedPath ? "muted" : "error"} mono>
           {pkg.installedPath ? shortenPath(pkg.installedPath) : t("i18n.notFound")}
-        </div>
-        <div style={{ color: "var(--text-dim)" }}>{t("i18n.cwd")}</div>
-        <div style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
+        </ConfigDetailGridRow>
+        <ConfigDetailGridRow label={t("i18n.cwd")} tone="dim" mono>
           {shortenPath(cwd)}
-        </div>
-      </div>
+        </ConfigDetailGridRow>
+      </ConfigDetailGrid>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text)" }}>
-          {t("i18n.resolvedResources")}
-        </div>
+        <ConfigSectionTitle>{t("i18n.resolvedResources")}</ConfigSectionTitle>
         <ResourceList pkg={pkg} />
       </div>
 
@@ -608,7 +463,7 @@ function PackageDetail({
           {actionError}
         </div>
       )}
-    </div>
+    </ConfigDetailStack>
   );
 }
 
@@ -620,6 +475,7 @@ export function PluginsConfig({
   onClose,
   onReloaded,
   embedded = false,
+  trust,
 }: {
   cwd: string;
   sessionId: string | null;
@@ -628,19 +484,22 @@ export function PluginsConfig({
   onClose: () => void;
   onReloaded?: (runtimeId: string | null) => void;
   embedded?: boolean;
+  /** The page's trust status for `cwd`; a new decision loads the list again. */
+  trust?: ProjectTrustStatus | null;
 }) {
-  const isMobile = useIsMobile();
   const { t } = useI18n();
   const [data, setData] = useState<PluginsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(() => getLastSettingsSelection("plugins", cwd));
   const [addMode, setAddMode] = useState(false);
   const [installSource, setInstallSource] = useState("");
   const [installScope, setInstallScope] = useState<PluginScope>("global");
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  // What the last group switch left undone, shown under that scope's heading.
+  const [groupStatus, setGroupStatus] = useState<{ scope: PluginScope; error?: string; note?: string } | null>(null);
 
   const packages = useMemo(() => data?.packages ?? [], [data?.packages]);
   const selectedPackage = packages.find((pkg) => packageKey(pkg) === selected) ?? null;
@@ -655,6 +514,7 @@ export function PluginsConfig({
   const loadPlugins = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setGroupStatus(null);
     try {
       const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
       const next = (await res.json()) as PluginsResponse & { error?: string };
@@ -674,13 +534,31 @@ export function PluginsConfig({
 
   useEffect(() => {
     void loadPlugins();
-  }, [loadPlugins]);
+  }, [cwd]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Whether project packages load, and the Project scope can be chosen, follows
+  // the folder's trust, which can change while this section stays mounted
+  // (hidden) in Settings: trusting from Settings › MCP. A new decision loads the
+  // list again in place, keeping the selection; the first
+  // load is the effect above.
+  const trustKey = projectTrustReloadKey(trust);
+  const loadedTrustKeyRef = useRef(trustKey);
+  useEffect(() => {
+    if (loadedTrustKeyRef.current === trustKey) return;
+    loadedTrustKeyRef.current = trustKey;
+    void loadPlugins();
+  }, [trustKey, loadPlugins]);
+
+  useEffect(() => {
+    if (selected) setLastSettingsSelection("plugins", selected, cwd);
+  }, [cwd, selected]);
 
   const runAction = useCallback(async (action: PluginAction, pkg: PluginPackageInfo) => {
     const key = packageKey(pkg);
     setBusyKey(`${action}:${key}`);
     setActionError(null);
     setActionMessage(null);
+    setGroupStatus(null);
     try {
       const res = await fetch("/api/plugins", {
         method: "POST",
@@ -693,13 +571,13 @@ export function PluginsConfig({
       if (action === "remove") {
         setSelected(next.packages[0] ? packageKey(next.packages[0]) : null);
         if (next.packages.length === 0) setAddMode(true);
-        setActionMessage("Package removed.");
+        setActionMessage(t("i18n.packageRemoved"));
       } else {
         const messages: Record<Exclude<PluginAction, "remove">, string> = {
-          install: "Package installed.",
-          update: "Package updated.",
-          disable: "Package disabled.",
-          enable: "Package enabled.",
+          install: t("i18n.packageInstalled"),
+          update: t("i18n.packageUpdated"),
+          disable: t("i18n.packageDisabled"),
+          enable: t("i18n.packageEnabled"),
         };
         setActionMessage(messages[action]);
       }
@@ -708,7 +586,68 @@ export function PluginsConfig({
     } finally {
       setBusyKey(null);
     }
-  }, [cwd]);
+  }, [cwd, t]);
+
+  // Behaves like the package switch, for every package of one scope: the
+  // confirmation appears in the package detail and the session is reloaded by
+  // hand. Packages the route refuses keep their state and are named under the
+  // scope's heading, and so are the filtered packages switching off leaves on.
+  const setGroupPackages = useCallback(async (
+    scope: PluginScope,
+    groupPackages: PluginPackageInfo[],
+    enabled: boolean,
+  ) => {
+    const targets = packagesToSwitch(groupPackages, enabled);
+    const keptOn = enabled ? 0 : filteredPackagesKeptOn(groupPackages).length;
+    const note = keptOn > 0 ? t("plugins.bulkKeptFiltered", { count: keptOn }) : undefined;
+    setActionError(null);
+    setActionMessage(null);
+    setGroupStatus(note ? { scope, note } : null);
+    if (targets.length === 0) return;
+    const action = enabled ? "enable" : "disable";
+    setBusyKey(`bulk:${scope}`);
+    try {
+      // omp's route toggles one source per request; run the group through it
+      // and track per-package outcomes the way the bulk response reported them.
+      const results: Array<{ source: string; error?: string }> = [];
+      let latest: PluginsResponse | null = null;
+      for (const { source } of targets) {
+        try {
+          const res = await fetch("/api/plugins", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action, source, scope, cwd }),
+          });
+          const next = (await res.json()) as PluginsResponse & { error?: string };
+          if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+          latest = next;
+          results.push({ source });
+        } catch (err) {
+          results.push({ source, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      if (latest) setData(latest);
+      const failures = results.filter((result) => result.error);
+      if (failures.length < results.length) {
+        const message = enabled ? t("plugins.bulkEnabled") : t("plugins.bulkDisabled");
+        setActionMessage(sessionId ? `${message} ${t("agents.reloadRequired")}` : message);
+      }
+      if (failures.length > 0) {
+        setGroupStatus({
+          scope,
+          note,
+          error: [
+            t("plugins.bulkFailed", { count: failures.length, total: results.length }),
+            ...failures.map((failure) => `${failure.source}: ${failure.error}`),
+          ].join("\n"),
+        });
+      }
+    } catch (err) {
+      setGroupStatus({ scope, note, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusyKey(null);
+    }
+  }, [cwd, sessionId, t]);
 
   const installPlugin = useCallback(async () => {
     const source = normalizePluginSourceInput(installSource).trim();
@@ -718,6 +657,7 @@ export function PluginsConfig({
     setBusyKey(`install:${key}`);
     setActionError(null);
     setActionMessage(null);
+    setGroupStatus(null);
     try {
       const res = await fetch("/api/plugins", {
         method: "POST",
@@ -731,297 +671,123 @@ export function PluginsConfig({
       setSelected(installed ? packageKey(installed) : key);
       setAddMode(false);
       setInstallSource("");
-      setActionMessage("Package installed.");
+      setActionMessage(t("i18n.packageInstalled"));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyKey(null);
     }
-  }, [cwd, installScope, installSource]);
+  }, [cwd, installScope, installSource, t]);
 
   const reloadSession = useCallback(async () => {
     if (!sessionId) return;
     setBusyKey("reload");
     setActionError(null);
     setActionMessage(null);
+    setGroupStatus(null);
     try {
       const binding = { current: runtimeId ?? null, onIdentity: onRuntimeIdentity };
       await sendAgentCommand(sessionId, { type: "reload" }, binding);
       onReloaded?.(binding.current);
       await loadPlugins();
-      setActionMessage("Session reloaded.");
+      setActionMessage(t("i18n.sessionReloaded"));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyKey(null);
     }
-  }, [loadPlugins, onReloaded, onRuntimeIdentity, runtimeId, sessionId]);
+  }, [loadPlugins, onReloaded, onRuntimeIdentity, runtimeId, sessionId, t]);
 
   const addBusy = busyKey?.startsWith("install:") ?? false;
+  const footerBusy = loading || busyKey !== null;
 
   return (
-    <div
-      style={{
-        position: embedded ? "relative" : "fixed",
-        inset: embedded ? undefined : 0,
-        width: "100%",
-        height: "100%",
-        zIndex: embedded ? undefined : 1000,
-        background: embedded ? "transparent" : "rgba(0,0,0,0.35)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-      onClick={(e) => {
-        if (!embedded && e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        style={{
-          width: embedded ? "100%" : isMobile ? "calc(100vw - 16px)" : 860,
-          maxWidth: embedded ? "none" : "calc(100vw - 16px)",
-          height: embedded ? "100%" : isMobile ? "calc(100dvh - 16px)" : "76vh",
-          maxHeight: embedded ? "none" : "calc(100dvh - 16px)",
-          background: "var(--bg)",
-          border: embedded ? "none" : "1px solid var(--border)",
-          borderRadius: embedded ? 0 : 8,
-          display: "flex",
-          flexDirection: "column",
-          boxShadow: embedded ? "none" : "0 8px 32px rgba(0,0,0,0.18)",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "12px 18px",
-            borderBottom: "1px solid var(--border)",
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "baseline", gap: 10, minWidth: 0 }}>
-            <span style={{ fontSize: 15, fontWeight: 700, color: "var(--text)" }}>
-              {t("common.plugins")}
-            </span>
-            <code
-              style={{
-                fontSize: 11,
-                color: "var(--text-muted)",
-                fontFamily: "var(--font-mono)",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {shortenPath(cwd)}
-            </code>
-          </div>
-          <button
-            onClick={onClose}
-            style={{
-              background: "none",
-              border: "none",
-              color: "var(--text-muted)",
-              cursor: "pointer",
-              fontSize: 20,
-              lineHeight: 1,
-              padding: "2px 6px",
-            }}
-          >
-            ×
-          </button>
-        </div>
+    <ConfigPanelShell embedded={embedded} title={t("common.plugins")} subtitle={shortenPath(cwd)} closeLabel={t("i18n.close")} onClose={onClose}>
 
-        {!projectResourcesLoaded && (
-          <div
-            role="status"
-            style={{
-              padding: "8px 18px",
-              borderBottom: "1px solid var(--border)",
-              background: "var(--bg-panel)",
-              color: "var(--text-muted)",
-              fontSize: 12,
-            }}
-          >
-            {t("trust.pluginsNotLoaded")}
-          </div>
-        )}
+        {!projectResourcesLoaded && <ConfigTrustNotice message={t("trust.pluginsNotLoaded")} />}
 
-        <div style={{ flex: 1, display: "flex", flexDirection: isMobile ? "column" : "row", overflow: "hidden" }}>
-          <div
-            style={{
-              width: isMobile ? "100%" : 245,
-              maxHeight: isMobile ? "40vh" : undefined,
-              borderRight: isMobile ? "none" : "1px solid var(--border)",
-              borderBottom: isMobile ? "1px solid var(--border)" : "none",
-              display: "flex",
-              flexDirection: "column",
-              flexShrink: 0,
-              background: "var(--bg-panel)",
-            }}
-          >
-            <div style={{ flex: 1, overflowY: "auto", padding: "8px 6px" }}>
+        <ConfigSplitView>
+          <ConfigSidebar>
+            <ConfigSidebarList>
               {loading ? (
-                <div style={{ padding: "10px 8px", fontSize: 12, color: "var(--text-muted)" }}>
-                  Loading...
+                <div className="config-sidebar-message">
+                  {t("i18n.loading")}
                 </div>
               ) : error ? (
-                <div style={{ padding: "10px 8px", fontSize: 11, color: "#ef4444" }}>
+                <div className="config-sidebar-message is-error">
                   {error}
                 </div>
               ) : packages.length === 0 ? (
-                <div style={{ padding: "10px 8px", fontSize: 11, color: "var(--text-dim)" }}>
-                  No plugins configured
+                <div className="config-sidebar-message is-empty">
+                  {t("i18n.noPlugins")}
                 </div>
               ) : (
-                groupedPackages.map((group) => (
-                  <div key={group.scope} style={{ marginBottom: 6 }}>
-                    <div
-                      style={{
-                        padding: "4px 8px 3px",
-                        fontSize: 10,
-                        fontWeight: 600,
-                        color: "var(--text-dim)",
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      {group.scope}
-                    </div>
-                    {group.packages.map((pkg) => {
-                      const key = packageKey(pkg);
-                      const isSelected = !addMode && selected === key;
-                      return (
-                        <div
-                          key={key}
-                          onClick={() => {
-                            setSelected(key);
-                            setAddMode(false);
-                            setActionError(null);
-                            setActionMessage(null);
-                          }}
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 7,
-                            padding: "8px 8px",
-                            borderRadius: 5,
-                            cursor: "pointer",
-                            background: isSelected ? "var(--bg-selected)" : "none",
-                          }}
-                          onMouseEnter={(e) => {
-                            if (!isSelected) e.currentTarget.style.background = "var(--bg-hover)";
-                          }}
-                          onMouseLeave={(e) => {
-                            if (!isSelected) e.currentTarget.style.background = "none";
-                          }}
+                <>
+                  {groupedPackages.map((group) => {
+                    const enabledCount = group.packages.filter((pkg) => !pkg.disabled).length;
+                    const allEnabled = enabledCount === group.packages.length;
+                    return (
+                      <div key={group.scope} className="config-sidebar-group">
+                        <ConfigSidebarGroupLabel
+                          aside={
+                            <ConfigSidebarGroupSwitch
+                              enabled={enabledCount}
+                              total={group.packages.length}
+                              disabled={footerBusy}
+                              loading={busyKey === `bulk:${group.scope}`}
+                              label={t(allEnabled ? "plugins.groupSwitchOn" : "plugins.groupSwitchOff", { group: scopeLabel(group.scope, t) })}
+                              onChange={(enabled) => void setGroupPackages(group.scope, group.packages, enabled)}
+                            />
+                          }
                         >
-                          <span
-                            style={{
-                              flexShrink: 0,
-                              width: 7,
-                              height: 7,
-                              borderRadius: "50%",
-                              background: statusColor(pkg.status),
-                            }}
-                          />
-                          <div style={{ minWidth: 0, flex: 1 }}>
-                            <div
-                              style={{
-                                fontSize: 12,
-                                fontWeight: isSelected ? 600 : 400,
-                                color: "var(--text)",
-                                fontFamily: "var(--font-mono)",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
+                          {scopeLabel(group.scope, t)}
+                        </ConfigSidebarGroupLabel>
+                        {groupStatus?.scope === group.scope && (
+                          <ConfigSidebarGroupStatus error={groupStatus.error} note={groupStatus.note} />
+                        )}
+                        {group.packages.map((pkg) => {
+                          const key = packageKey(pkg);
+                          const isSelected = !addMode && selected === key;
+                          return (
+                            <ConfigSidebarItem
+                              key={key}
+                              active={isSelected}
+                              title={pkg.source}
+                              onClick={() => {
+                                setSelected(key);
+                                setAddMode(false);
+                                setActionError(null);
+                                setActionMessage(null);
                               }}
                             >
-                              {pkg.source}
-                            </div>
-                            <div
-                              style={{
-                                fontSize: 10,
-                                color: "var(--text-dim)",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                                marginTop: 2,
-                              }}
-                            >
-                              {resourceSummary(pkg, t)}
-                            </div>
-                            {(pkg.version || pkg.configuredVersion) && (
-                              <div
-                                style={{
-                                  fontSize: 10,
-                                  color: "var(--text-dim)",
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                  marginTop: 2,
-                                }}
-                              >
-                                 {versionSummary(pkg, t)}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))
+                              <ConfigStatusDot active={!pkg.disabled} color={statusColor(pkg.status)} />
+                              <ConfigSidebarText className={`is-grow${pkg.disabled ? " is-muted" : ""}`}>
+                                {pkg.source}
+                              </ConfigSidebarText>
+                            </ConfigSidebarItem>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </>
               )}
-            </div>
-            <div style={{ padding: "8px 6px", borderTop: "1px solid var(--border)", flexShrink: 0 }}>
-              <button
-                type="button"
+            </ConfigSidebarList>
+            <ConfigListAction
+                active={addMode}
                 onClick={() => {
                   setAddMode(true);
                   setActionError(null);
                   setActionMessage(null);
                 }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "7px 8px",
-                  borderRadius: 5,
-                  border: "none",
-                  width: "100%",
-                  cursor: "pointer",
-                  background: addMode ? "var(--bg-selected)" : "none",
-                  color: addMode ? "var(--accent)" : "var(--text-dim)",
-                  fontSize: 12,
-                }}
-                onMouseEnter={(e) => {
-                  if (!addMode) e.currentTarget.style.background = "var(--bg-hover)";
-                }}
-                onMouseLeave={(e) => {
-                  if (!addMode) e.currentTarget.style.background = "none";
-                }}
               >
-                <svg
-                  width="13"
-                  height="13"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
                  {t("i18n.addPlugin")}
-              </button>
-            </div>
-          </div>
+            </ConfigListAction>
+          </ConfigSidebar>
 
-          <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
-            {addMode ? (
+          <ConfigDetail>
+            <ConfigDetailStack className="is-fill">
+              {addMode ? (
               <AddPluginPanel
                 cwd={cwd}
                 source={installSource}
@@ -1045,56 +811,31 @@ export function PluginsConfig({
                 onAction={runAction}
                 onReloadSession={reloadSession}
               />
-            ) : (
-              <div
-                style={{
-                  height: "100%",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--text-dim)",
-                  fontSize: 13,
-                }}
-              >
-                {t("i18n.selectPackage")}
-              </div>
-            )}
-          </div>
-        </div>
+              ) : (
+                <ConfigEmptyState>{t("i18n.selectPackage")}</ConfigEmptyState>
+              )}
+            </ConfigDetailStack>
+          </ConfigDetail>
+        </ConfigSplitView>
 
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-            padding: "10px 18px",
-            borderTop: "1px solid var(--border)",
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ minWidth: 0, flex: 1, fontSize: 11, color: "var(--text-dim)", overflow: "hidden" }}>
-            {data?.diagnostics.length ? (
-              <span
-                title={data.diagnostics.map((d) => `${d.type}: ${d.source ? `${d.source}: ` : ""}${d.message}`).join("\n")}
-                style={{ color: data.diagnostics.some((d) => d.type === "error") ? "#ef4444" : "#d97706" }}
-              >
-                {data.diagnostics.length} diagnostic{data.diagnostics.length === 1 ? "" : "s"}
-              </span>
+        <ConfigFooter status={
+            data?.diagnostics.length ? (
+              <ConfigFooterStatus
+                tone={data.diagnostics.some((d) => d.type === "error") ? "error" : "warning"}
+                summary={data.diagnostics.length === 1
+                  ? t("plugins.diagnostic")
+                  : t("plugins.diagnostics", { count: data.diagnostics.length })}
+                details={data.diagnostics.map(diagnosticText)}
+              />
             ) : (
-              <span>
-                {data ? `${data.totals.extensions} ext · ${data.totals.skills} skills · ${data.totals.prompts} prompts · ${data.totals.themes} themes` : ""}
-              </span>
+              <ConfigFooterStatus summary={data ? totalsSummary(data.totals, t) : ""} />
             )}
-          </div>
-          <button onClick={() => void loadPlugins()} disabled={loading || busyKey !== null} style={buttonStyle(loading || busyKey !== null)}>
+        >
+          {!embedded && <ConfigButton onClick={onClose}>{t("i18n.close")}</ConfigButton>}
+          <ConfigButton variant="secondary" onClick={() => void loadPlugins()} disabled={footerBusy}>
              {t("i18n.refresh")}
-          </button>
-          <button onClick={onClose} style={buttonStyle(false)}>
-             {t("i18n.close")}
-          </button>
-        </div>
-      </div>
-    </div>
+          </ConfigButton>
+        </ConfigFooter>
+    </ConfigPanelShell>
   );
 }

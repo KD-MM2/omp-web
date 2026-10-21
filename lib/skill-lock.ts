@@ -24,6 +24,7 @@ interface GlobalLockPathOptions {
 interface AnnotateSkillOptions {
   cwd: string;
   agentDir: string;
+  homeDir?: string;
   globalLockPath?: string;
   projectLockPath?: string;
 }
@@ -123,23 +124,27 @@ export function annotateSkillsWithInstallInfo(
   {
     cwd,
     agentDir,
-    globalLockPath = getGlobalSkillsLockPath(),
+    homeDir = homedir(),
+    globalLockPath = getGlobalSkillsLockPath({ homeDir }),
     projectLockPath = join(cwd, "skills-lock.json"),
   }: AnnotateSkillOptions,
 ): SkillInfo[] {
   const globalEntries = readSkillLock(globalLockPath);
   const projectEntries = readSkillLock(projectLockPath);
-  // omp reads its own `~/.omp/agent/skills` plus the Claude layout that the
-  // `skills` CLI writes into; treat both as managed install roots.
-  const globalSkillsRoots = [join(agentDir, "skills"), join(homedir(), ".claude", "skills")];
-  const projectSkillsRoots = [join(cwd, ".omp", "skills"), join(cwd, ".claude", "skills")];
+
+  // omp reads its own `~/.omp/agent/skills`, the Agent Skills dirs
+  // (`~/.agents/skills`) that the CLI (1.7+) and the `skills` CLI ecosystem
+  // write into, plus the Claude layout; treat all as managed install roots.
+  const globalSkillsRoots = [join(agentDir, "skills"), join(homeDir, ".agents", "skills"), join(homeDir, ".claude", "skills")];
+  const projectSkillsRoots = [join(cwd, ".omp", "skills"), join(cwd, ".agents", "skills"), join(cwd, ".claude", "skills")];
+  const isWithinAny = (path: string, roots: string[]) => roots.some((root) => isWithin(path, root));
 
   return skills.map((skill) => {
     if (!existsSync(skill.filePath)) return skill;
 
-    const install = globalSkillsRoots.some((root) => isWithin(skill.filePath, root))
+    const install = isWithinAny(skill.filePath, globalSkillsRoots)
       ? getInstallInfo(globalEntries, skill.name, "global")
-      : projectSkillsRoots.some((root) => isWithin(skill.filePath, root))
+      : isWithinAny(skill.filePath, projectSkillsRoots)
         ? getInstallInfo(projectEntries, skill.name, "project")
         : undefined;
 

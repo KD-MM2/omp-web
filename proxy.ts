@@ -1,5 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 import {
+  getAuthRetryAfterMs,
+  recordAuthFailure,
+  retryAfterSeconds,
+} from "@/lib/auth-throttle";
+import {
   isApiRequestAllowed,
   isApiRequestHostAllowed,
 } from "@/lib/request-security";
@@ -48,6 +53,16 @@ function unauthorizedPage(): string {
 `;
 }
 
+function tooManyAttempts(retryAfterMs: number): NextResponse {
+  return new NextResponse("Too many failed attempts", {
+    status: 429,
+    headers: {
+      "Cache-Control": "no-store",
+      "Retry-After": String(retryAfterSeconds(retryAfterMs)),
+    },
+  });
+}
+
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const isApiRequest = pathname === "/api" || pathname.startsWith("/api/");
@@ -66,7 +81,18 @@ export function proxy(request: NextRequest) {
   // but only after the host and cross-site checks above have run.
   if (pathname === RECOVERY_PAGE || pathname === RECOVERY_API) return NextResponse.next();
 
-  const decision = authorizeWebRequest(request.headers.get("authorization"));
+  const authorization = request.headers.get("authorization");
+  // Every Basic header is a password guess, so it shares the login throttle;
+  // otherwise every API path answers guesses at full speed. While blocked even
+  // the right password is refused, or the answer would leak. A success does not
+  // reset the counter: Basic clients authenticate on every request, and each
+  // reset would hand an interleaved guesser a fresh short block.
+  if (authorization && /^Basic\s/i.test(authorization)) {
+    const retryAfterMs = getAuthRetryAfterMs();
+    if (retryAfterMs > 0) return tooManyAttempts(retryAfterMs);
+  }
+
+  const decision = authorizeWebRequest(authorization);
 
   if (decision === "unavailable") {
     const message = "Password access is enabled but the omp-web credential file could not be read."
@@ -77,6 +103,7 @@ export function proxy(request: NextRequest) {
   }
 
   if (decision === "unauthorized") {
+    if (authorization && /^Basic\s/i.test(authorization)) recordAuthFailure();
     return isApiRequest
       ? NextResponse.json(
         { error: "Authentication required", recoveryPath: RECOVERY_PAGE },
