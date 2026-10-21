@@ -133,7 +133,13 @@ const nativeVariants =
         ["@oh-my-pi/pi-natives-win32-x64", "@oh-my-pi/pi-natives"],
         ["@oh-my-pi/omp-stats", "@oh-my-pi/omp-stats"],
       ]
-    : [
+    : process.platform === "linux"
+      ? [
+          ["@next/swc-linux-x64-gnu", "next"],
+          ["@oh-my-pi/pi-natives-linux-x64", "@oh-my-pi/pi-natives"],
+          ["@oh-my-pi/omp-stats", "@oh-my-pi/omp-stats"],
+        ]
+      : [
         ["@next/swc-darwin-arm64", "next"],
         ["@oh-my-pi/pi-natives-darwin-arm64", "@oh-my-pi/pi-natives"],
         ["@oh-my-pi/omp-stats", "@oh-my-pi/omp-stats"],
@@ -146,8 +152,13 @@ const nativeVariants =
       ];
 for (const [name, host] of nativeVariants) {
   const src = join(root, "node_modules", name);
+  const dest = join(server, "node_modules", name);
+  // The production install may already have hoisted the package in (Bun
+  // hardlinks it from the shared cache, so a copy onto it is EINVAL — and
+  // the hoisted copy is the right version anyway).
+  if (existsSync(dest)) continue;
   if (existsSync(src)) {
-    cpSync(src, join(server, "node_modules", name), { recursive: true });
+    cpSync(src, dest, { recursive: true });
     continue;
   }
   let version;
@@ -169,7 +180,11 @@ for (const [name, host] of nativeVariants) {
 
 // 6. Bun runtime for this platform (macOS bundles both archs — universal app)
 const triples =
-  process.platform === "win32" ? ["windows-x64"] : ["darwin-aarch64", "darwin-x64"];
+  process.platform === "win32"
+    ? ["windows-x64"]
+    : process.platform === "linux"
+      ? ["linux-x64"]
+      : ["darwin-aarch64", "darwin-x64"];
 const resources = join(root, "src-tauri", "resources");
 for (const triple of triples) {
   const name = triple === "windows-x64" ? "bun-windows-x64.exe" : `bun-${triple}`;
