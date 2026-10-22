@@ -1,4 +1,11 @@
 export const VISIBLE_PAGE_SIZE = 50;
+// Server-side entry cap for one upward page (`/context?before=…&tail=…`).
+// Bounded pages keep long-session paging from shipping the whole branch.
+export const LOAD_OLDER_PAGE_TAIL = 200;
+// Hard ceiling on entries the saved-position restore loop may expand into the
+// DOM while hunting its anchor; past this, restoration gives up and shows the
+// bottom instead of OOM-killing low-memory (mobile) webviews.
+export const RESTORE_ENTRY_BUDGET = 1500;
 export const CHAT_SCROLL_TAIL_TOLERANCE = 8;
 export const CHAT_SCROLL_REATTACH_TOLERANCE = 96;
 

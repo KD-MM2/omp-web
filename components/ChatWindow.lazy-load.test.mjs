@@ -4,7 +4,7 @@ import test from "node:test";
 import { Script, createContext } from "node:vm";
 import ts from "typescript";
 
-const { captureScrollDistance, getNextVisibleCount } = await import("../lib/chat-lazy-load.ts");
+const { captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL } = await import("../lib/chat-lazy-load.ts");
 
 const source = ts.createSourceFile("ChatWindow.tsx", await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const nodes = [];
@@ -30,7 +30,7 @@ function mount({ hasEarlierMessages, landed = true }) {
     sentinel: {}, scrollContainerRef: { current: { scrollHeight: 4000, scrollTop: 0 } },
     loadingOlderRef: { current: false }, prevScrollDistanceRef: { current: null }, requestedCursorRef: { current: null },
     hasEarlierMessages, historyCursor: "older", session: { id: "a" }, sessionIdRef: { current: "a" }, activeLeafId: "leaf",
-    captureScrollDistance, getNextVisibleCount,
+    captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL,
     setVisibleCount: (update) => { calls.visibleCount = update(calls.visibleCount); },
     loadContext: (...args) => { calls.loads.push(args); return Promise.resolve(landed ? { oldestEntryId: "oldest" } : undefined); },
     IntersectionObserver: class { constructor(callback) { observed = callback; } observe() {} disconnect() {} },
@@ -68,7 +68,7 @@ test("with every message loaded, reaching the top widens the window over rows st
 test("with older history on the server, reaching the top fetches the previous page", async () => {
   const { visibleCount, loads } = await reachTop({ hasEarlierMessages: true });
   assert.equal(visibleCount, 50);
-  assert.deepEqual(loads.map((args) => [...args]), [["a", "leaf", "older", undefined]]);
+  assert.deepEqual(loads.map(([sid, leaf, cursor, opts]) => [sid, leaf, cursor, opts?.tail]), [["a", "leaf", "older", LOAD_OLDER_PAGE_TAIL]]);
 });
 
 test("a report before the next cursor renders does not fetch the landed page again", async () => {

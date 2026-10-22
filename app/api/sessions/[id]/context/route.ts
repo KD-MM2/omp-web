@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
-import { resolveSessionPath, buildSessionContext, getHistoricalContextUsage } from "@/lib/session-reader";
+import { resolveSessionPath, buildSessionContext, getHistoricalContextUsage, CONTEXT_DEFAULT_TAIL } from "@/lib/session-reader";
 import { getRpcSession, getFinalRpcSessionId } from "@/lib/rpc-manager";
 
 export async function GET(
@@ -14,9 +14,12 @@ export async function GET(
   const deferToolResultImages = url.searchParams.has("deferMedia");
   // Page upward: `before` is the oldest entry already loaded, so the next page
   // starts at its parent. `tail` bounds the visible window (routes cap at 1000).
+  // A request without `tail` is capped too: unbounded responses made every
+  // session open ship the whole branch to the browser, which OOM-kills mobile
+  // webviews on long sessions. `hasMore`/`oldestEntryId` page the rest upward.
   const before = url.searchParams.get("before");
   const rawTail = Number(url.searchParams.get("tail"));
-  const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : undefined;
+  const tail = Math.min(Number.isFinite(rawTail) && rawTail > 0 ? rawTail : CONTEXT_DEFAULT_TAIL, 1000);
 
   try {
     const directRpc = getRpcSession(id);

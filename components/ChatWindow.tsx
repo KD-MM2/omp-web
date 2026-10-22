@@ -42,6 +42,8 @@ import {
   getPromptAnchorSpacerHeight,
   getVisibleRenderWindow,
   isScrollAtTail,
+  LOAD_OLDER_PAGE_TAIL,
+  RESTORE_ENTRY_BUDGET,
   restoreScrollTop,
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
@@ -586,16 +588,23 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       loadingOlderRef.current = true;
       let before = initialHistory.historyCursor;
       let hasMore = initialHistory.hasEarlierMessages;
+      // Hunting an anchor far from the tail used to page unbounded (and widen
+      // the render window to the whole branch), which OOM-kills mobile
+      // webviews on long sessions. Pages are bounded and the hunt stops at a
+      // DOM budget; beyond it the position is abandoned (bottom fallback) and
+      // the user reaches deep history via the sentinel's own bounded paging.
+      let scannedEntries = initialHistory.entryIds.length;
       try {
-        while (hasMore && before && !controller.signal.aborted) {
-          const context = await loadOlderPage(sessionId, before, { signal: controller.signal });
+        while (hasMore && before && !controller.signal.aborted && scannedEntries < RESTORE_ENTRY_BUDGET) {
+          const context = await loadOlderPage(sessionId, before, { signal: controller.signal, tail: LOAD_OLDER_PAGE_TAIL });
           if (controller.signal.aborted) return;
           if (!context) {
             scrollToBottom("instant");
             setPendingScrollRestore(null);
             return;
           }
-          setVisibleCount((current) => current + Math.max(VISIBLE_PAGE_SIZE, context.messages.length * 2));
+          scannedEntries += context.entryIds?.length ?? context.messages.length;
+          setVisibleCount((current) => current + Math.max(VISIBLE_PAGE_SIZE, context.messages.length + VISIBLE_PAGE_SIZE));
           if (context.entryIds.includes(position.anchorEntryId)) {
             setRestoreAnchorReady(true);
             return;
@@ -710,7 +719,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
         if (!sid) return;
         loadingOlderRef.current = true;
         prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
-        void loadOlderPage(sid, oldestId).finally(() => {
+        void loadOlderPage(sid, oldestId, { tail: LOAD_OLDER_PAGE_TAIL }).finally(() => {
           loadingOlderRef.current = false;
         });
       },

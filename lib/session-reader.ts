@@ -777,6 +777,12 @@ export interface BuildSessionContextOptions {
   excludeLeaf?: boolean;
 }
 
+// A context response without an explicit `tail` is bounded to this many newest
+// entries of the active branch. Shipping the whole branch on every open made
+// mobile webviews OOM on long sessions; clients page the remainder upward via
+// `oldestEntryId`/`hasMore` (see /api/sessions/[id] and .../context).
+export const CONTEXT_DEFAULT_TAIL = 300;
+
 /**
  * Displayable messages for the chat window, in render order, with the entry
  * ids behind them so the browser can fork and navigate branches.
