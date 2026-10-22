@@ -76,7 +76,7 @@ test("the brand is a button named for what its click shows, with the brand's tex
   for (const locale of ["en", "zh-CN", "zh-TW"]) {
     const label = getLocalePlugin(locale).messages["sidebar.brandLabel"];
     assert.ok(label?.startsWith("omp"), `${locale}: ${label}`);
-    assert.match(label, /\{app\}[\s\S]*\{pi\}/);
+    assert.match(label, /\{app\}[\s\S]*\{omp\}/);
   }
 });
 

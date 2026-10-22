@@ -119,7 +119,7 @@ export function PiWebTitle({ onWidthChange }: {
     <button
       type="button"
       className={`sidebar-brand${versionShown ? " is-version" : ""}`}
-      aria-label={t("sidebar.brandLabel", { app: appVersion ?? "0.0.0", pi: ompVersion ?? "0.0.0" })}
+      aria-label={t("sidebar.brandLabel", { app: appVersion ?? "0.0.0", omp: ompVersion ?? "0.0.0" })}
       onClick={handleClick}
     >
       {text}
