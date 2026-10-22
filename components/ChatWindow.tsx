@@ -1349,7 +1349,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 <>
                   {hasMore && (
                      <div ref={setSentinel} className="py-3 text-center text-xs text-text-muted">
-                       {t("chat.loadEarlier")}
+                       {t("chat.loadEarlier", { count: earlierTurnCount })}
                     </div>
                   )}
                   {rendered.slice(startIndex)}
