@@ -40,7 +40,7 @@ function text(html) {
 function server(overrides) {
   return {
     scope: "project",
-    sourcePath: "/repo/.pi/mcp.json",
+    sourcePath: "/repo/.omp/mcp.json",
     configKey: "key",
     enabled: true,
     validated: true,
@@ -60,7 +60,7 @@ function loaded({ servers = [], file = {}, status = untrusted } = {}) {
   return {
     state: "loaded",
     listing: {
-      mcpFile: { scope: "project", path: "/repo/.pi/mcp.json", exists: true, problems: [], ...file },
+      mcpFile: { scope: "project", path: "/repo/.omp/mcp.json", exists: true, problems: [], ...file },
       mcpServers: servers,
     },
     status,
@@ -121,7 +121,7 @@ test("each server shows its transport, what it would run or reach, and why it is
   }));
   const shown = text(html);
   assert.match(html, /<section class="project-trust-mcp" aria-labelledby="project-trust-mcp-title">/);
-  assert.match(shown, /^MCP servers in \.pi\/mcp\.json Trusting this project lets these servers connect/);
+  assert.match(shown, /^MCP servers in \.omp\/mcp\.json Trusting this project lets these servers connect/);
 
   const items = html.split('<li class="project-trust-mcp-server">').slice(1).map(text);
   assert.equal(items.length, 5);
@@ -129,25 +129,25 @@ test("each server shows its transport, what it would run or reach, and why it is
   assert.equal(
     repo,
     'repo stdio node server.js "a b" --token ••• Working directory: ./tools Runs a shell command on every connection: env TOKEN'
-      + " Passes environment variables of the computer running Pi Web to the command it starts: HOST_KEY in env HOME_KEY"
+      + " Passes environment variables of the computer running omp-web to the command it starts: HOST_KEY in env HOME_KEY"
       + " Parts that look like secrets are hidden.",
   );
   assert.equal(
     github,
     "github HTTP https://evil.example/mcp Runs a shell command on every connection: header Authorization"
-      + " Sends environment variables of the computer running Pi Web to this server on every connection:"
+      + " Sends environment variables of the computer running omp-web to this server on every connection:"
       + " GITHUB_TOKEN in header X-Api-Key AWS_SECRET_ACCESS_KEY in oauth.clientSecret"
       + " Replaces your global server of the same name while this project is trusted.",
   );
   // A refused entry has no transport tag, and still shows what it names.
   assert.equal(
     legacy,
-    'legacy https://legacy.example/sse Pi refuses this entry, so it never connects: server "legacy": legacy SSE transport is not supported',
+    'legacy https://legacy.example/sse omp refuses this entry, so it never connects: server "legacy": legacy SSE transport is not supported',
   );
-  // The pi CLI shares the trust decision and does not refuse the password, so this is a warning, not a reassurance.
+  // The omp CLI shares the trust decision and does not refuse the password, so this is a warning, not a reassurance.
   assert.equal(
     leaky,
-    "leaky stdio node References PI_WEB_PASSWORD. Pi Web refuses to connect it, but the pi CLI reads this file too"
+    "leaky stdio node References PI_WEB_PASSWORD. omp-web refuses to connect it, but the omp CLI reads this file too"
       + " and would send the password on if that variable is set where the CLI runs: env PASS",
   );
   assert.match(html, /<p class="project-trust-mcp-line is-warning">References PI_WEB_PASSWORD\./);
@@ -186,28 +186,28 @@ test("a file problem is explained, and one that hides servers the SDK still load
   })));
   assert.equal(
     unparsable,
-    "MCP servers in .pi/mcp.json The file is not valid JSON, so none of its servers load. Unexpected end of JSON input",
+    "MCP servers in .omp/mcp.json The file is not valid JSON, so none of its servers load. Unexpected end of JSON input",
   );
 
   const outside = render(h(ProjectTrustMcpSection, {
     listing: loaded({
-      file: { realPath: "/elsewhere/mcp.json", problems: [{ reason: "link-outside", error: "a symbolic link outside the folders Pi Web may read" }] },
+      file: { realPath: "/elsewhere/mcp.json", problems: [{ reason: "link-outside", error: "a symbolic link outside the folders omp-web may read" }] },
     }),
   }));
-  assert.match(text(outside), /so its servers are not listed here\. Pi still loads them once the project is trusted\. \/elsewhere\/mcp\.json$/);
+  assert.match(text(outside), /so its servers are not listed here\. omp still loads them once the project is trusted\. \/elsewhere\/mcp\.json$/);
   assert.match(outside, /<code class="project-trust-mcp-detail">\/elsewhere\/mcp\.json<\/code>/);
 
   const tooLarge = text(render(h(ProjectTrustMcpSection, {
     listing: loaded({ file: { problems: [{ reason: "too-large", error: "larger than 1048576 bytes" }] } }),
   })));
-  assert.match(tooLarge, /Pi still loads them once the project is trusted\.$/);
+  assert.match(tooLarge, /omp still loads them once the project is trusted\.$/);
   assert.doesNotMatch(tooLarge, /1048576/, "a reason without a useful diagnostic shows only its translation");
 });
 
 test("an empty file, a missing one, and an unchecked listing", () => {
   assert.equal(
     text(render(h(ProjectTrustMcpSection, { listing: loaded() }))),
-    "MCP servers in .pi/mcp.json The file declares no servers.",
+    "MCP servers in .omp/mcp.json The file declares no servers.",
   );
   assert.equal(render(h(ProjectTrustMcpSection, { listing: loaded({ file: { exists: false } }) })), "");
   const unchecked = text(render(h(ProjectTrustMcpSection, {
@@ -219,7 +219,7 @@ test("an empty file, a missing one, and an unchecked listing", () => {
 test("while the listing loads it says so, and Trust waits for it", () => {
   const html = render(h(ProjectTrustDialog, { cwd: "/repo", busy: false, error: null, onCancel() {}, onConfirm() {} }));
   assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="project-trust-title" aria-describedby="project-trust-description" tabindex="-1" class="project-trust-dialog"/);
-  assert.match(html, /<p id="project-trust-mcp-status" role="status" class="project-trust-mcp-status">Reading \.pi\/mcp\.json…<\/p>/);
+  assert.match(html, /<p id="project-trust-mcp-status" role="status" class="project-trust-mcp-status">Reading \.omp\/mcp\.json…<\/p>/);
   assert.match(html, /<button type="button" class="project-trust-button is-primary" disabled="" aria-describedby="project-trust-mcp-status">Trust project<\/button>/);
   assert.match(html, /<button type="button" class="project-trust-button">Cancel<\/button>/);
   assert.match(html, /<code class="project-trust-path">\/repo<\/code>/);
@@ -270,13 +270,13 @@ test("a trust store that cannot be read is said so, above the servers still list
   const html = view({ listing });
   assert.match(
     text(html),
-    /Pi Web cannot read the trust store \(trust\.json\), or another program has it locked\. Lock file is already being held MCP servers in \.pi\/mcp\.json .* repo stdio node/,
+    /omp-web cannot read the trust store \(trust\.json\), or another program has it locked\. Lock file is already being held MCP servers in \.omp\/mcp\.json .* repo stdio node/,
   );
   assert.match(html, /class="project-trust-button is-primary">Trust project<\/button>/);
 });
 
 test("a GET answer becomes a listing: the status beside it, or only the listing when the trust store failed", () => {
-  const file = { scope: "project", path: "/repo/.pi/mcp.json", exists: true, problems: [] };
+  const file = { scope: "project", path: "/repo/.omp/mcp.json", exists: true, problems: [] };
   assert.deepEqual(projectTrustListingFrom(true, 200, { ...untrusted, decisionPath: "/repo", mcpFile: file, mcpServers: [] }), {
     state: "loaded",
     listing: { mcpFile: file, mcpServers: [] },
@@ -298,7 +298,7 @@ test("a GET answer becomes a listing: the status beside it, or only the listing 
 test("a listing that failed names why, or gives its diagnostic when there is nothing to translate", () => {
   assert.equal(
     text(render(h(ProjectTrustMcpSection, { listing: { state: "failed", error: "Access denied", reason: "cwd-denied" } }))),
-    "Could not list this project's MCP servers. Pi Web may not read this folder.",
+    "Could not list this project's MCP servers. omp-web may not read this folder.",
   );
   assert.equal(
     text(render(h(ProjectTrustMcpSection, { listing: { state: "failed", error: "trust.json is locked", reason: "internal" } }))),
