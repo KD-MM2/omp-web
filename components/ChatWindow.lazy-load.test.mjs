@@ -4,7 +4,7 @@ import test from "node:test";
 import { Script, createContext } from "node:vm";
 import ts from "typescript";
 
-const { captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL } = await import("../lib/chat-lazy-load.ts");
+const { captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL, RESTORE_ENTRY_BUDGET } = await import("../lib/chat-lazy-load.ts");
 
 const source = ts.createSourceFile("ChatWindow.tsx", await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const nodes = [];
@@ -30,7 +30,7 @@ function mount({ hasEarlierMessages, landed = true }) {
     sentinel: {}, scrollContainerRef: { current: { scrollHeight: 4000, scrollTop: 0 } },
     loadingOlderRef: { current: false }, prevScrollDistanceRef: { current: null }, requestedCursorRef: { current: null },
     hasEarlierMessages, historyCursor: "older", session: { id: "a" }, sessionIdRef: { current: "a" }, activeLeafId: "leaf",
-    captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL,
+    captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL, RESTORE_ENTRY_BUDGET, visibleCount: 50,
     setVisibleCount: (update) => { calls.visibleCount = update(calls.visibleCount); },
     loadContext: (...args) => { calls.loads.push(args); return Promise.resolve(landed ? { oldestEntryId: "oldest" } : undefined); },
     IntersectionObserver: class { constructor(callback) { observed = callback; } observe() {} disconnect() {} },

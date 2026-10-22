@@ -39,6 +39,7 @@ import { findChatScrollAnchor, type ChatScrollPosition } from "@/lib/chat-scroll
 import {
   captureScrollDistance,
   getNextVisibleCount,
+  getNextWindowCount,
   getPromptAnchorSpacerHeight,
   getVisibleRenderWindow,
   isScrollAtTail,
@@ -310,7 +311,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     handleRecallQueue,
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, handleSetDefaultModel, handleSetDefaultThinkingLevel, loadSlashCommands, scrollUserMsgToTop,
-    loadContext, activeLeafId, scrollToBottom, scrollToMessage, resumeAutoFollow,
+    loadContext, activeLeafId, scrollToBottom, scrollToMessage, resumeAutoFollow, autoFollowPaused,
   } = useAgentSession({
     session, sessionRunning, newSessionCwd, newSessionDraftKey, initialNewSessionChoices, onNewSessionChoicesChange, onAgentEnd: wrappedOnAgentEnd, onToolEnd, onAttentionNeeded, onSessionCreated, onSessionForked,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
@@ -699,8 +700,10 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries[0]?.isIntersecting) return;
-        // Skip while a page is already loading.
         if (loadingOlderRef.current) return;
+        // The window stops widening past the DOM budget: past it, paging more
+        // history is exactly the mobile OOM this whole path exists to avoid.
+        if (visibleCount >= RESTORE_ENTRY_BUDGET) return;
         if (!hasEarlierMessages) {
           // Everything is loaded, yet the sentinel shows: the messages render as
           // more rows than the window holds (an answer and its thinking are
@@ -729,11 +732,17 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     return () => observer.disconnect();
   }, [sentinel, visibleCount, historyCursor, hasEarlierMessages, session, loadOlderPage, sessionIdRef, scrollContainerRef]);
 
-  // Keep the rendered window at least as large as what's loaded, so prepended
-  // (older) pages stay visible instead of being sliced off the top.
+  // Sliding tail window: while the view rides the newest turn, new commits
+  // slide in at the bottom and the oldest rendered rows drop off the top
+  // (they stay on the server; the sentinel re-pages them). While detached —
+  // reading older content — the window keeps growing to cover every loaded
+  // row so prepended pages are never sliced away mid-read.
   useEffect(() => {
-    setVisibleCount((current) => Math.max(current, messages.length));
-  }, [messages.length]);
+    // Read the follow flag the streaming/scroll effects own, not a one-tick
+    // scroll sample: a fresh commit grows the content before auto-scroll
+    // catches up, so an instantaneous position probe misreads "attached".
+    setVisibleCount((current) => getNextWindowCount(current, messages.length, !autoFollowPaused));
+  }, [messages.length, autoFollowPaused]);
 
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
@@ -1347,7 +1356,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               const hasMore = startIndex > 0 || hasEarlierMessages;
               return (
                 <>
-                  {hasMore && (
+                  {hasMore && visibleCount < RESTORE_ENTRY_BUDGET && (
                      <div ref={setSentinel} className="py-3 text-center text-xs text-text-muted">
                        {t("chat.loadEarlier", { count: earlierTurnCount })}
                     </div>
