@@ -23,14 +23,15 @@ const forgetCursor = compile(hook("useEffect", "requestedCursorRef.current = nul
 
 // Mounts the observer effect with the given history state; `reachTop()` is the
 // sentinel coming into view, `render(cursor)` the next cursor rendering.
-function mount({ hasEarlierMessages, landed = true }) {
+function mount({ hasEarlierMessages, landed = true, top = 0 }) {
   const calls = { visibleCount: 50, loads: [] };
   let observed = null;
   const context = createContext({
-    sentinel: {}, scrollContainerRef: { current: { scrollHeight: 4000, scrollTop: 0 } },
+    sentinel: {}, scrollContainerRef: { current: { scrollHeight: 4000, scrollTop: top, clientHeight: 100 } },
     loadingOlderRef: { current: false }, prevScrollDistanceRef: { current: null }, requestedCursorRef: { current: null },
     hasEarlierMessages, historyCursor: "older", session: { id: "a" }, sessionIdRef: { current: "a" }, activeLeafId: "leaf",
     captureScrollDistance, getNextVisibleCount, LOAD_OLDER_PAGE_TAIL, RESTORE_ENTRY_BUDGET, visibleCount: 50,
+    isScrollAtTail: (scrollTop, clientHeight, scrollHeight) => scrollTop + clientHeight >= scrollHeight - 8,
     setVisibleCount: (update) => { calls.visibleCount = update(calls.visibleCount); },
     loadContext: (...args) => { calls.loads.push(args); return Promise.resolve(landed ? { oldestEntryId: "oldest" } : undefined); },
     IntersectionObserver: class { constructor(callback) { observed = callback; } observe() {} disconnect() {} },
@@ -93,4 +94,12 @@ test("a page that did not land, or a cursor a reload brought back, is fetched ag
   reloaded.render("older");
   await reloaded.reachTop();
   assert.deepEqual(cursors(reloaded.calls), ["older", "older"]);
+});
+
+test("a view riding the tail ignores the sentinel: no fetch, no stale capture", async () => {
+  const chat = mount({ hasEarlierMessages: true, top: 3900 });
+  await chat.reachTop();
+  assert.deepEqual(chat.calls.loads, []);
+  assert.equal(chat.context.prevScrollDistanceRef.current, null);
+  assert.equal(chat.calls.visibleCount, 50);
 });

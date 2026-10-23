@@ -37,6 +37,7 @@ import { getTranscriptNotices, summarizeCacheMisses, type CacheMissSummary } fro
 import { cacheMissSummaryText, TRANSCRIPT_NOTICE_WARNING_COLOR, TranscriptNoticeLines } from "@/components/TranscriptNotices";
 import { findChatScrollAnchor, type ChatScrollPosition } from "@/lib/chat-scroll-position";
 import {
+  CHAT_SCROLL_TAIL_TOLERANCE,
   captureScrollDistance,
   getNextVisibleCount,
   getNextWindowCount,
@@ -509,6 +510,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   const [sentinel, setSentinel] = useState<HTMLDivElement | null>(null);
   const messageContentRef = useRef<HTMLDivElement | null>(null);
   const prevScrollDistanceRef = useRef<number | null>(null);
+  const prevVisibleCountRef = useRef<number | null>(null);
   const loadingOlderRef = useRef(false);
   const restoreStartedRef = useRef(false);
   const pendingScrollRestoreRef = useRef(pendingScrollRestore);
@@ -701,6 +703,14 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       (entries) => {
         if (!entries[0]?.isIntersecting) return;
         if (loadingOlderRef.current) return;
+        // Only a view riding the tail may ignore the sentinel: it wants no
+        // older turns, and paging here would store a bottom-distance
+        // measured on un-expanded content (a mount-time artifact that a
+        // later restore would misapply toward the window's top). Position,
+        // not the follow flag, is the honest signal — a restored session
+        // can be "attached" by flag yet sitting at the top of its window,
+        // where the reader absolutely does want the older page.
+        if (isScrollAtTail(container.scrollTop, container.clientHeight, container.scrollHeight)) return;
         // The window stops widening past the DOM budget: past it, paging more
         // history is exactly the mobile OOM this whole path exists to avoid.
         if (visibleCount >= RESTORE_ENTRY_BUDGET) return;
@@ -747,9 +757,28 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
   useEffect(() => {
+    const previous = prevVisibleCountRef.current;
+    prevVisibleCountRef.current = visibleCount;
     if (prevScrollDistanceRef.current == null) return;
+    // Only growth is a prepend. A slide (the window trimming rows off the
+    // top) has nothing to restore, and consuming the saved distance there
+    // would misplace the view by the trimmed height.
+    if (previous !== null && visibleCount <= previous) {
+      prevScrollDistanceRef.current = null;
+      return;
+    }
     const container = scrollContainerRef.current;
     if (!container) return;
+    // A view that has come to rest on the tail stays there: prepending
+    // above the tail does not change what the tail shows, so the only
+    // thing a large pending distance could do now is yank the reader off
+    // the newest turn toward the window's top. A distance captured while
+    // already riding the tail (≤ tolerance) simply re-pins the bottom.
+    if (isScrollAtTail(container.scrollTop, container.clientHeight, container.scrollHeight)
+        && prevScrollDistanceRef.current > CHAT_SCROLL_TAIL_TOLERANCE) {
+      prevScrollDistanceRef.current = null;
+      return;
+    }
     container.scrollTop = restoreScrollTop(container.scrollHeight, prevScrollDistanceRef.current);
     prevScrollDistanceRef.current = null;
   }, [visibleCount, scrollContainerRef]);
