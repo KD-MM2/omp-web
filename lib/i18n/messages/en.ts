@@ -472,6 +472,7 @@ export const enLocale: LocalePlugin = {
     "sidebar.uiStateFailed": "Couldn’t save: {error}",
     "sidebar.sessionNotFound": "This session no longer exists",
     "sidebar.fork": "Fork",
+    "sidebar.forkSession": "Fork {title}?",
     "sidebar.openInNewTab": "Open in new tab",
     "sidebar.forkedToast": "Forked “{title}”",
     "sidebar.forkNotFound": "This session no longer exists",

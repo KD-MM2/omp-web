@@ -619,6 +619,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
   const [renamingRootId, setRenamingRootId] = useState<string | null>(null);
   const [renamingProjectKey, setRenamingProjectKey] = useState<string | null>(null);
   const [confirmDeleteRootId, setConfirmDeleteRootId] = useState<string | null>(null);
+  const [confirmForkRootId, setConfirmForkRootId] = useState<string | null>(null);
   const [menu, setMenu] = useState<SidebarMenuState | null>(null);
   // A row the main tree should scroll to (a fork's new row); see
   // SessionTreeReveal. Held until the tree says it is done with it.
@@ -1915,6 +1916,15 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
     }
   }, [performDelete]);
 
+  // Fork asks first: the copy used to appear silently wearing its source's
+  // own title, so a stray menu tap or F keypress forked a session nobody can
+  // notice, let alone undo. The row answers with a question naming the copy.
+  const requestFork = useCallback((family: SessionFamily) => {
+    setRenamingRootId(null);
+    setConfirmDeleteRootId(null);
+    setConfirmForkRootId(family.root.id);
+  }, []);
+
   // Fork (the row menu's F): the server copies the family's current branch
   // into a new session beside it (POST /api/sessions/[id]/fork) and leaves
   // the source as it is, running or not. The copy opens where its row is: the
@@ -1961,8 +1971,8 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
   // One fork per session at a time: F again on a session whose fork is under
   // way does nothing; another session's Fork goes ahead.
   const forkingIdsRef = useRef(new Set<string>());
-  const forkFamily = useCallback(async (row: SessionRow) => {
-    const source = row.family.root;
+  const forkFamily = useCallback(async (family: SessionFamily, fromRowKey: string | null) => {
+    const source = family.root;
     if (source.transient || forkingIdsRef.current.has(source.id)) return;
     forkingIdsRef.current.add(source.id);
     const selectedAtClick = selectedSessionIdRef.current;
@@ -1997,7 +2007,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
         showToast(message, [{ id: "open", label: t("sidebar.open"), onClick: () => openForkedRef.current(forked, null) }], tail);
         return;
       }
-      openForkedRef.current(forked, row.key);
+      openForkedRef.current(forked, fromRowKey);
       showToast(message, [], tail);
     } catch (error) {
       showToast(t("sidebar.forkFailed", { error: error instanceof Error ? error.message : String(error) }));
@@ -2025,7 +2035,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
       case "pin": setFamilyPinned(family, true); break;
       case "unpin": setFamilyPinned(family, false); break;
       case "rename": startRename(family); break;
-      case "fork": void forkFamily(row); break;
+      case "fork": requestFork(family); break;
       case "mark-read": markFamilyRead(family, true); break;
       case "mark-unread": markFamilyRead(family, false); break;
       case "archive": archiveFamily(family); break;
@@ -2045,7 +2055,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
   // menu stays.
   const handleContextMenu = useCallback((row: SessionRow, event: ReactMouseEvent) => {
     const session = row.family.root;
-    if (session.id === renamingRootId || session.id === confirmDeleteRootId) return;
+    if (session.id === renamingRootId || session.id === confirmDeleteRootId || session.id === confirmForkRootId) return;
     if (dispatchSessionRowContextMenu({
       id: session.id,
       path: session.path,
@@ -2073,7 +2083,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
     const inRow = active instanceof HTMLElement && rowElement !== null && rowElement.contains(active);
     contextMenuFocusRef.current = !inRow && active instanceof HTMLElement && active !== document.body ? active : null;
     openRowMenu(row, anchor, inRow ? active : null);
-  }, [confirmDeleteRootId, loadSessions, openRowMenu, renamingRootId]);
+  }, [confirmDeleteRootId, confirmForkRootId, loadSessions, openRowMenu, renamingRootId]);
 
   const treeSelectionInput = useMemo(() => ({
     sessions: allSessions,
@@ -2647,6 +2657,7 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
     renamingRootId,
     renamingProjectKey,
     confirmDeleteRootId,
+    confirmForkRootId,
     activeMenuRowKey,
     onSelectFamily: handleSelectFamily,
     onToggleGroup: handleToggleGroup,
@@ -2665,6 +2676,16 @@ export function SessionSidebar({ selectedSessionId, selectedRuntimeId, optimisti
     onDeleteCancel: () => {
       const rootId = confirmDeleteRootId;
       setConfirmDeleteRootId(null);
+      // Cancel goes with the confirmation: the row's own button takes focus.
+      if (rootId) focusAfterCommit(() => familyRowButton(rootId));
+    },
+    onForkConfirm: (family: SessionFamily, fromRowKey: string | null) => {
+      setConfirmForkRootId(null);
+      void forkFamily(family, fromRowKey);
+    },
+    onForkCancel: () => {
+      const rootId = confirmForkRootId;
+      setConfirmForkRootId(null);
       // Cancel goes with the confirmation: the row's own button takes focus.
       if (rootId) focusAfterCommit(() => familyRowButton(rootId));
     },

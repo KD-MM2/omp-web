@@ -41,6 +41,7 @@ import {
   BranchIcon,
   ChevronIcon,
   FolderPlusIcon,
+  ForkIcon,
   MoreIcon,
   PinIcon,
   PlusIcon,
@@ -102,6 +103,9 @@ export interface SessionTreeProps {
   /** The project whose group header is a name field (its menu's Rename…). */
   renamingProjectKey: string | null;
   confirmDeleteRootId: string | null;
+  /** The row whose Fork confirmation the row shows. Fork asks first: the copy
+   * used to appear silently under its source's own title. */
+  confirmForkRootId: string | null;
   /** Row whose menu is open: kept mounted, its ⋯ shown pressed. A group row's key works too. */
   activeMenuRowKey: string | null;
   onSelectFamily(family: SessionFamily): void;
@@ -125,6 +129,9 @@ export interface SessionTreeProps {
   onRenameProjectCancel(): void;
   onDeleteConfirm(family: SessionFamily, event: ReactMouseEvent): void;
   onDeleteCancel(): void;
+  /** Fork confirm: `fromRowKey` is the source row's key (focus return). */
+  onForkConfirm(family: SessionFamily, fromRowKey: string | null, event: ReactMouseEvent): void;
+  onForkCancel(): void;
   /** A group's "+": a new session in that project at once. */
   onGroupNew(project: SidebarProject): void;
   onGroupMenu(project: SidebarProject, opener: HTMLElement): void;
@@ -177,6 +184,7 @@ export function SessionTree(props: SessionTreeProps): ReactNode {
     renamingRootId,
     renamingProjectKey,
     confirmDeleteRootId,
+    confirmForkRootId,
     activeMenuRowKey,
     reveal,
   } = props;
@@ -291,11 +299,11 @@ export function SessionTree(props: SessionTreeProps): ReactNode {
     const indices: number[] = [];
     rows.forEach((row, index) => {
       if (row.key === focusedRowKey || row.key === activeMenuRowKey || row.key === pendingRevealKey || row.key === draggedRowKey) indices.push(index);
-      else if (row.kind === "session" && (row.family.root.id === renamingRootId || row.family.root.id === confirmDeleteRootId)) indices.push(index);
+      else if (row.kind === "session" && (row.family.root.id === renamingRootId || row.family.root.id === confirmDeleteRootId || row.family.root.id === confirmForkRootId)) indices.push(index);
       else if (row.kind === "group" && row.project.key === renamingProjectKey) indices.push(index);
     });
     return indices;
-  }, [rows, focusedRowKey, activeMenuRowKey, pendingRevealKey, draggedRowKey, renamingRootId, renamingProjectKey, confirmDeleteRootId]);
+  }, [rows, focusedRowKey, activeMenuRowKey, pendingRevealKey, draggedRowKey, renamingRootId, renamingProjectKey, confirmDeleteRootId, confirmForkRootId]);
   const visibleIndices = useMemo(
     () => (loading ? [] : getVisibleRowIndices(offsets, scrollTop, viewportHeight, OVERSCAN_PX, keepMounted)),
     [loading, offsets, scrollTop, viewportHeight, keepMounted],
@@ -436,7 +444,7 @@ export function SessionTree(props: SessionTreeProps): ReactNode {
                     height={height}
                     now={now}
                     renaming={row.family.root.id === renamingRootId}
-                    confirming={row.family.root.id === confirmDeleteRootId}
+                    confirming={row.family.root.id === confirmDeleteRootId ? "delete" : row.family.root.id === confirmForkRootId ? "fork" : null}
                     menuOpen={menuOpen}
                     handlers={handlersRef}
                   />
@@ -508,7 +516,7 @@ const SessionRowView = memo(function SessionRowView({
   height: number;
   now: number;
   renaming: boolean;
-  confirming: boolean;
+  confirming: "delete" | "fork" | null;
   menuOpen: boolean;
   handlers: Handlers;
 }) {
@@ -528,7 +536,9 @@ const SessionRowView = memo(function SessionRowView({
   ].filter(Boolean).join(" ");
 
   if (confirming) {
+    const isForkConfirm = confirming === "fork";
     const shortTitle = title.slice(0, DELETE_TITLE_MAX) + (title.length > DELETE_TITLE_MAX ? "…" : "");
+    const cancel = () => (isForkConfirm ? handlers.current.onForkCancel() : handlers.current.onDeleteCancel());
     return (
       <div
         className={className}
@@ -538,20 +548,23 @@ const SessionRowView = memo(function SessionRowView({
           if (event.key !== "Escape" || isImeKey(event)) return;
           event.preventDefault();
           event.stopPropagation();
-          handlers.current.onDeleteCancel();
+          cancel();
         }}
       >
         <DeleteConfirm
-          label={t("sidebar.deleteSession", { title: shortTitle })}
-          deleteLabel={t("sidebar.delete")}
+          label={isForkConfirm ? t("sidebar.forkSession", { title: shortTitle }) : t("sidebar.deleteSession", { title: shortTitle })}
+          actionLabel={isForkConfirm ? t("sidebar.fork") : t("sidebar.delete")}
+          buttonClass={isForkConfirm ? "session-tree-confirm-fork" : "session-tree-confirm-delete"}
+          icon={isForkConfirm ? <ForkIcon size={12} /> : <TrashIcon size={12} />}
           cancelLabel={t("sidebar.cancel")}
           onConfirm={(event) => {
             event.stopPropagation();
-            handlers.current.onDeleteConfirm(family, event);
+            if (isForkConfirm) handlers.current.onForkConfirm(family, row.key, event);
+            else handlers.current.onDeleteConfirm(family, event);
           }}
           onCancel={(event) => {
             event.stopPropagation();
-            handlers.current.onDeleteCancel();
+            cancel();
           }}
         />
       </div>
@@ -776,13 +789,17 @@ function RenameInput({
 
 function DeleteConfirm({
   label,
-  deleteLabel,
+  actionLabel,
+  buttonClass,
+  icon,
   cancelLabel,
   onConfirm,
   onCancel,
 }: {
   label: string;
-  deleteLabel: string;
+  actionLabel: string;
+  buttonClass: string;
+  icon: ReactNode;
   cancelLabel: string;
   onConfirm: (event: ReactMouseEvent) => void;
   onCancel: (event: ReactMouseEvent) => void;
@@ -799,9 +816,9 @@ function DeleteConfirm({
   return (
     <>
       <span className="session-tree-confirm-text">{label}</span>
-      <button type="button" className="session-tree-confirm-delete" onClick={onConfirm}>
-        <TrashIcon size={12} />
-        {deleteLabel}
+      <button type="button" className={buttonClass} onClick={onConfirm}>
+        {icon}
+        {actionLabel}
       </button>
       <button ref={cancelRef} type="button" className="session-tree-confirm-cancel" onClick={onCancel}>
         {cancelLabel}

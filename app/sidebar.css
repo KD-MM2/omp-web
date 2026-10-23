@@ -475,6 +475,7 @@ a.session-tree-main {
 }
 
 .session-tree .session-tree-confirm-delete,
+.session-tree .session-tree-confirm-fork,
 .session-tree .session-tree-confirm-cancel {
   display: flex;
   flex: none;
@@ -492,6 +493,15 @@ a.session-tree-main {
   border: 1px solid #ef4444;
   background: #ef4444;
   color: #fff;
+  font-weight: 600;
+}
+
+/* The fork answer is constructive, not destructive: the row's neutral key,
+ * set apart from Cancel by weight alone. */
+.session-tree .session-tree-confirm-fork {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
   font-weight: 600;
 }
 
@@ -860,6 +870,7 @@ a.session-tree-main {
 }
 
 .session-tree.is-mobile .session-tree-confirm-delete,
+.session-tree.is-mobile .session-tree-confirm-fork,
 .session-tree.is-mobile .session-tree-confirm-cancel {
   height: 32px;
 }
