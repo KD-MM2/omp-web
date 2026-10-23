@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
 import { refreshDirsFromEnv } from "@oh-my-pi/pi-utils";
+import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 
 const jiti = createJiti(import.meta.url, {
   alias: { "@": process.cwd() },
@@ -22,6 +23,14 @@ test("status reads of a session's state leave out its system prompt (#1302)", as
     if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousDir;
     refreshDirsFromEnv();
+    // Startup may ensureDir the per-cwd store directory against the pre-refresh
+    // (real) store root; sweep this test's temp project so it leaves no row.
+    const sessionsRoot = getSessionsDir();
+    for (const name of await readdir(sessionsRoot).catch(() => [])) {
+      if (name.startsWith("-tmp-pi-web-agent-state-")) {
+        await rm(join(sessionsRoot, name), { recursive: true, force: true });
+      }
+    }
     await rm(dir, { recursive: true, force: true });
   });
   // A project whose context file makes the prompt large, as the issue's ~350 KB replies were.
