@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const TRIPLES = ["darwin-aarch64", "darwin-x64", "windows-x64"];
+const TRIPLES = ["darwin-aarch64", "darwin-x64", "linux-x64", "windows-x64"];
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const RESOURCES_DIR = join(REPO_ROOT, "src-tauri", "resources");
@@ -77,10 +77,13 @@ async function fetchTriple(triple, version) {
   try {
     await Bun.write(zipPath, new Uint8Array(await res.arrayBuffer()));
 
-    // bsdtar handles zip archives on macOS and Windows.
-    const tar = spawnSync("tar", ["-xf", zipPath, "-C", extractDir], { encoding: "utf8" });
+    // bsdtar handles zip archives on macOS and Windows; GNU tar (Linux) cannot.
+    let tar = spawnSync("tar", ["-xf", zipPath, "-C", extractDir], { encoding: "utf8" });
     if (tar.status !== 0) {
-      throw new Error(`tar extraction failed: ${tar.stderr || tar.stdout || "unknown error"}`);
+      tar = spawnSync("python3", ["-m", "zipfile", "-e", zipPath, extractDir], { encoding: "utf8" });
+      if (tar.status !== 0) {
+        throw new Error(`zip extraction failed: ${tar.stderr || tar.stdout || "unknown error"}`);
+      }
     }
 
     const inner = join(extractDir, `bun-${triple}`, isWindows ? "bun.exe" : "bun");

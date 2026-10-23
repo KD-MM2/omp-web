@@ -57,6 +57,10 @@ fn bun_binary_name() -> &'static str {
     {
         "bun-darwin-x64"
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "bun-linux-x64"
+    }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "bun-windows-x64.exe"
@@ -64,6 +68,7 @@ fn bun_binary_name() -> &'static str {
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "x86_64"),
     )))]
     {

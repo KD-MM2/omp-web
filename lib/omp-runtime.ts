@@ -36,7 +36,9 @@ async function createRuntime(): Promise<OmpRuntime> {
   // Pinning the registry to this exact AuthStorage keeps credential_disabled
   // events flowing to the same instance the routes read from.
   const modelRegistry = new ModelRegistry(authStorage);
-  await modelRegistry.refresh("online-if-uncached");
+  // PI_OFFLINE is the fork's test/airgap switch (plugin-updates and the export
+  // route already honor it): never reach a discovery endpoint under it.
+  await modelRegistry.refresh(process.env.PI_OFFLINE ? "offline" : "online-if-uncached");
   return { agentDir, settings, authStorage, modelRegistry };
 }
 

@@ -34,7 +34,7 @@ export interface ImageContent {
 export interface ThinkingContent {
   type: "thinking";
   thinking: string;
-  /** Historical content omitted from the initial response and loaded on demand. */
+  /** Historical content is a short preview; full reasoning is loaded on demand. */
   deferred?: boolean;
 }
 
@@ -43,6 +43,8 @@ export interface ToolCallContent {
   toolCallId: string;
   toolName: string;
   input: Record<string, unknown>;
+  /** Client-only buffer for streamed tool input. Never persisted to session files. */
+  rawInput?: string;
 }
 
 export type AssistantContentBlock = TextContent | ImageContent | ThinkingContent | ToolCallContent;
@@ -53,6 +55,20 @@ export interface UserMessage {
   timestamp?: number;
 }
 
+export interface AgentUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+}
+
 export interface AssistantMessage {
   role: "assistant";
   content: AssistantContentBlock[];
@@ -60,20 +76,11 @@ export interface AssistantMessage {
   provider: string;
   stopReason?: string;
   errorMessage?: string;
+  /** When the request started. */
   timestamp?: number;
-  usage?: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    cost: {
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      total: number;
-    };
-  };
+  /** From `timestamp` until the response ended, measured by pi (pi 1.1); absent for older messages. */
+  durationMs?: number;
+  usage?: AgentUsage;
 }
 
 export interface ToolResultMessage {
@@ -84,6 +91,9 @@ export interface ToolResultMessage {
   isError?: boolean;
   details?: unknown;
   timestamp?: number;
+  /** How long the tool ran, measured by pi with a monotonic clock (pi 1.1); absent for older results. */
+  durationMs?: number;
+  usage?: AgentUsage;
 }
 
 export interface CustomMessage {
@@ -191,6 +201,23 @@ export interface SubagentSnapshot {
 }
 
 
+/**
+ * Prompt and tool loadout carried by the session transcript (Pi >= 0.86). The
+ * leading one holds the base prompt; later ones patch `sections` by name and
+ * list tool changes. Never a chat message: the UI hides it everywhere.
+ */
+export interface SystemMessage {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: unknown[];
+  toolsRemoved?: Array<{ name: string }>;
+  timestamp?: number;
+}
+
+/** Any message a `message` entry can store, including transcript system messages. */
+export type SessionMessage = AgentMessage | SystemMessage;
+
 export type ExtensionUiRequest =
   | {
       type: "extension_ui_request";
@@ -216,6 +243,8 @@ export type ExtensionUiRequest =
       title: string;
       planFilePath: string;
       planContent: string;
+      timeout?: number;
+      expiresAt?: number;
     }
   | {
       type: "extension_ui_request";
@@ -309,7 +338,7 @@ export interface ExtensionWidgetItem {
 
 export interface SessionMessageEntry extends SessionEntryBase {
   type: "message";
-  message: AgentMessage;
+  message: SessionMessage;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -323,6 +352,16 @@ export interface ModelChangeEntry extends SessionEntryBase {
   modelId: string;
 }
 
+/** Model usage outside the conversation, such as prompt-cache warming (`kind: "cache_warm"`). */
+export interface UsageEntry extends SessionEntryBase {
+  type: "usage";
+  kind: string;
+  provider: string;
+  model: string;
+  usage: AgentUsage;
+  note?: string;
+}
+
 export interface CompactionEntry extends SessionEntryBase {
   type: "compaction";
   summary: string;
@@ -330,6 +369,7 @@ export interface CompactionEntry extends SessionEntryBase {
   tokensBefore: number;
   details?: unknown;
   fromHook?: boolean;
+  usage?: AgentUsage;
 }
 
 export interface BranchSummaryEntry extends SessionEntryBase {
@@ -338,6 +378,7 @@ export interface BranchSummaryEntry extends SessionEntryBase {
   summary: string;
   details?: unknown;
   fromHook?: boolean;
+  usage?: AgentUsage;
 }
 
 export interface CustomEntry extends SessionEntryBase {
@@ -365,14 +406,27 @@ export interface SessionInfoEntry extends SessionEntryBase {
   name?: string;
 }
 
+/**
+ * Append-only edit of an earlier entry's model context. Raw history, usage
+ * and the UI are unaffected: `replacement: null` omits the target from future
+ * provider requests, a value replaces only its content.
+ */
+export interface ContextEditEntry extends SessionEntryBase {
+  type: "context_edit";
+  targetId: string;
+  replacement: { content: unknown } | null;
+}
+
 export type SessionEntry =
   | SessionMessageEntry
   | ThinkingLevelChangeEntry
   | ModelChangeEntry
+  | UsageEntry
   | CompactionEntry
   | BranchSummaryEntry
   | CustomEntry
   | CustomMessageEntry
+  | ContextEditEntry
   | LabelEntry
   | SessionInfoEntry;
 
@@ -382,6 +436,15 @@ export interface BranchPreview {
   role?: "user" | "assistant";
   text: string;
 }
+
+export type SubagentSessionStatus =
+  | "starting"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "aborted"
+  | "interrupted";
 
 export interface SessionTreeNode {
   entry: SessionEntry;
@@ -402,13 +465,32 @@ export interface SessionInfo {
   modified: string;
   messageCount: number;
   firstMessage: string;
-  parentSessionId?: string; // set if this session was forked from another
+  /** True while the sidebar has only header/stat metadata for this session. */
+  detailsPending?: boolean;
+  parentSessionId?: string; // source session for a fork, or parent session for a subagent
+  /** How this session relates to another session. Forks remain top-level in the
+   *  UI; only subagent relations form a visible parent/child tree. */
+  relation?:
+    | { kind: "fork"; originSessionId?: string }
+    | {
+        kind: "subagent";
+        parentSessionId: string;
+        profile: string;
+        description: string;
+        status: SubagentSessionStatus;
+      };
   /** Main repo root shared by all worktrees of this cwd (cwd itself for non-git dirs).
    *  Always set by the server; optional because the client builds transient
    *  SessionInfo objects before the first refresh. Fall back to cwd. */
   projectRoot?: string;
-  /** Branch name when cwd is a linked git worktree (not the main checkout) */
-  worktreeBranch?: string;
+  /** Stable server-computed project identity for grouping and comparison.
+   *  Unlike projectRoot, Windows keys are case- and separator-insensitive.
+   *  Internal only: use projectRoot/cwd for display and filesystem operations. */
+  projectKey?: string;
+  /** Current git branch for any git repo (undefined for non-git or detached HEAD) */
+  branch?: string;
+  /** True when cwd is a linked git worktree (not the main checkout) */
+  isWorktree?: boolean;
   /** True while the runtime session exists only in memory and its JSONL file
    *  has not been created yet. Disk-backed actions must wait until this clears. */
   transient?: boolean;
@@ -417,6 +499,10 @@ export interface SessionInfo {
 export interface SessionContext {
   messages: AgentMessage[];
   entryIds: string[]; // parallel to messages — the session entry id for each message
+  oldestEntryId: string | null;
+  hasMore: boolean;
+  /** Turns on the branch before `oldestEntryId`, not loaded (the minimap numbers from it). */
+  turnsBefore: number;
   thinkingLevel: string;
   configuredThinkingLevel: string;
   model: { provider: string; modelId: string } | null;

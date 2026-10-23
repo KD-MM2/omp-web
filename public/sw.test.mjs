@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 const listeners = new Map();
 globalThis.self = {
@@ -26,6 +26,60 @@ function dispatchNotificationClick(data) {
   return { pending, wasClosed: () => closed };
 }
 
+function dispatchPush(payload, clients) {
+  let pending;
+  const shown = [];
+  self.clients = {
+    matchAll: async () => clients,
+    openWindow: async () => assert.fail("push must not open windows"),
+  };
+  self.registration = {
+    showNotification: async (title, options) => { shown.push({ title, options }); },
+  };
+  listeners.get("push")({
+    data: { json: () => payload },
+    waitUntil: (promise) => { pending = promise; },
+  });
+  return { pending, shown };
+}
+
+test("push always shows a notification, even when a window is visible", async () => {
+  const event = dispatchPush(
+    {
+      title: "Session complete",
+      body: "Task finished.",
+      url: "/?session=session-1",
+      tag: "pi-session-complete:session-1",
+    },
+    [
+      { url: "https://pi.test/?session=other", visibilityState: "hidden" },
+      { url: "https://pi.test/?session=session-1", visibilityState: "visible" },
+    ],
+  );
+  await event.pending;
+
+  // iOS revokes the push subscription when a push is handled without a
+  // notification, so the notification must never be suppressed.
+  assert.deepEqual(event.shown, [{
+    title: "Session complete",
+    options: {
+      body: "Task finished.",
+      data: { url: "/?session=session-1" },
+      tag: "pi-session-complete:session-1",
+      renotify: true,
+    },
+  }]);
+});
+
+test("push ignores malformed payloads", async () => {
+  const event = dispatchPush(
+    { title: "", body: 42 },
+    [],
+  );
+  await event.pending;
+
+  assert.deepEqual(event.shown, []);
+});
 test("notification click focuses an existing client at the session URL", async () => {
   const calls = [];
   const focusedClient = {
@@ -83,4 +137,202 @@ test("notification click opens a window and rejects cross-origin targets", async
   await event.pending;
 
   assert.deepEqual(opened, ["https://pi.test/"]);
+});
+
+// A reachable port backed by a dead upstream answers nothing at all, so these
+// tests drive fetch() with a stub that only settles once the worker aborts it.
+function installOfflineStub() {
+  const offline = new Response("<!doctype html><title>Pi Web is offline</title>", {
+    status: 200,
+    headers: { "Content-Type": "text/html" },
+  });
+  globalThis.caches = {
+    match: async (request) => ((typeof request === "string" ? request : request.url).endsWith("/offline.html")
+      ? offline
+      : undefined),
+    open: async () => ({ put: async () => {} }),
+  };
+}
+
+function dispatchFetch(url, { mode = "cors", method = "GET" } = {}) {
+  let pending;
+  const background = [];
+  const request = new Request(url, { method });
+  Object.defineProperty(request, "mode", { value: mode });
+  listeners.get("fetch")({
+    request,
+    respondWith: (promise) => { pending = promise; },
+    waitUntil: (promise) => { background.push(promise); },
+  });
+  return { pending, background };
+}
+
+test("install precaches offline assets but not the runtime manifest", async () => {
+  let pending;
+  let precached;
+  let skipped = false;
+  globalThis.caches = {
+    open: async () => ({ addAll: async (urls) => { precached = urls; } }),
+  };
+  self.skipWaiting = async () => { skipped = true; };
+  listeners.get("install")({ waitUntil: (promise) => { pending = promise; } });
+  await pending;
+
+  assert.deepEqual(precached, [
+    "/offline.html",
+    "/icons/icon-192.png",
+    "/icons/icon-512.png",
+    "/icons/apple-touch-icon.png",
+  ]);
+  assert.equal(skipped, true);
+});
+
+test("manifest requests bypass the worker even with query strings and old cached entries", async () => {
+  const stale = new Response('{"name":"Old Pi"}');
+  let cacheReads = 0;
+  globalThis.caches = {
+    match: async () => { cacheReads++; return stale.clone(); },
+    open: async () => assert.fail("manifest must not be cached"),
+  };
+  const networkRequests = [];
+  globalThis.fetch = async (request) => {
+    networkRequests.push(request.url);
+    return new Response('{"name":"New Pi"}');
+  };
+
+  for (const path of ["/manifest.webmanifest", "/manifest.webmanifest?v=old"]) {
+    for (const mode of ["cors", "navigate"]) {
+      const url = `https://pi.test${path}`;
+      const { pending, background } = dispatchFetch(url, { mode });
+      assert.equal(pending, undefined, "no respondWith: leave the request to the browser");
+      assert.deepEqual(background, []);
+      // Model the browser's normal network fallback when respondWith is absent.
+      const response = await fetch(new Request(url));
+      assert.deepEqual(await response.json(), { name: "New Pi" });
+    }
+  }
+  assert.equal(cacheReads, 0, "old cached manifests must never be read");
+  assert.equal(networkRequests.length, 4);
+});
+
+/** fetch() that never settles until the signal it was handed is aborted. */
+function installHungNetwork() {
+  let aborted = false;
+  globalThis.fetch = (_request, init) =>
+    new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      });
+    });
+  return () => aborted;
+}
+
+/**
+ * Let a handler's await chain reach its fetch (and schedule its timer) before
+ * the fake clock is ticked. setImmediate is not faked, unlike setTimeout.
+ */
+const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a stalled navigation falls back to offline.html", async () => {
+  installOfflineStub();
+  const wasAborted = installHungNetwork();
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { pending } = dispatchFetch("https://pi.test/", { mode: "navigate" });
+    await flushMicrotasks();
+    mock.timers.tick(8000);
+    const response = await pending;
+
+    assert.equal(wasAborted(), true, "a hung upstream must be aborted, not awaited forever");
+    assert.match(await response.text(), /Pi Web is offline/);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a stalled static asset request is bounded as well", async () => {
+  installOfflineStub();
+  const wasAborted = installHungNetwork();
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { pending } = dispatchFetch("https://pi.test/_next/static/chunks/app.js");
+    // cacheFirst awaits the cache lookup before it reaches the network.
+    await flushMicrotasks();
+    mock.timers.tick(8000);
+
+    assert.equal(wasAborted(), true);
+    await assert.rejects(pending, /abort/i);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a cache miss responds before the cache write finishes", async () => {
+  let releaseWrite;
+  let writeStarted = false;
+  globalThis.caches = {
+    match: async () => undefined,
+    open: async () => ({
+      put: () => {
+        writeStarted = true;
+        return new Promise((resolve) => { releaseWrite = resolve; });
+      },
+    }),
+  };
+  // fetch() to a same-origin URL yields type "basic"; a constructed Response
+  // defaults to "default", which cacheFirst deliberately skips.
+  globalThis.fetch = async () => {
+    const response = new Response("chunk", {
+      status: 200,
+      headers: { "Content-Type": "text/javascript" },
+    });
+    Object.defineProperty(response, "type", { value: "basic" });
+    return response;
+  };
+
+  const { pending, background } = dispatchFetch("https://pi.test/_next/static/chunks/app.js");
+  const response = await pending;
+
+  // The regression this guards: the SW script URL is versioned, so a version
+  // bump leaves the cache cold and every chunk misses at once. Awaiting each
+  // write held the responses behind Cache Storage I/O, which pushed
+  // navigations past the offline-fallback budget even though the server was
+  // healthy. The response must never wait for the write.
+  assert.equal(await response.text(), "chunk");
+
+  await flushMicrotasks();
+  assert.equal(writeStarted, true, "the write must still happen");
+  assert.equal(background.length, 1, "the write must be kept alive with waitUntil");
+
+  releaseWrite();
+  await background[0];
+});
+
+test("a response that arrives in time is not cut off mid-stream", async () => {
+  installOfflineStub();
+  let signal;
+  globalThis.fetch = async (_request, init) => {
+    signal = init.signal;
+    return new Response("<!doctype html><title>Pi Web</title>", {
+      status: 200,
+      headers: { "Content-Type": "text/html" },
+    });
+  };
+
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { pending } = dispatchFetch("https://pi.test/", { mode: "navigate" });
+    const response = await pending;
+    // The budget only covers time to first byte: a long-lived body keeps
+    // streaming past it (Next.js streams its SSR payload).
+    mock.timers.tick(60000);
+
+    assert.equal(signal.aborted, false);
+    assert.match(await response.text(), /<title>Pi Web<\/title>/);
+  } finally {
+    mock.timers.reset();
+  }
 });

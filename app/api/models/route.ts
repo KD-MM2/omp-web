@@ -1,3 +1,4 @@
+import { existsSync } from "fs";
 import { stat } from "fs/promises";
 import { resolve } from "path";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -10,6 +11,7 @@ import {
 import { resolveVisibleModels, selectInitialModelScope } from "@/lib/model-scope";
 import { listModelRoles, readDefaultModelRole } from "@/lib/model-roles";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
+import { inferRemovedWorktree } from "@/lib/worktree";
 import { getOmpRuntime, getSettingsForCwd } from "@/lib/omp-runtime";
 import { getSetting } from "@/lib/omp-settings";
 
@@ -56,6 +58,14 @@ async function loadModels(cwd: string): Promise<ModelsData> {
   if (initial.model) {
     defaultModel = { provider: initial.model.provider, modelId: initial.model.id };
   }
+  // The level a fresh session starts with, and the raw setting the reasoning
+  // menu stars: the `:level` suffix on the `default` role selector.
+  const defaultThinkingLevel = initial.thinkingLevel ?? null;
+  const defaultSelector = settings.getModelRole("default");
+  const selectorSlash = defaultSelector ? defaultSelector.indexOf("/") : -1;
+  const savedDefaultThinkingLevel = selectorSlash > 0
+    ? defaultSelector!.slice(selectorSlash + 1).split(":")[1] ?? null
+    : null;
 
   // omp assigns a model per scope of work; ship the whole role table so the
   // browser's selector can group models the same way `/model` does.
@@ -66,6 +76,8 @@ async function loadModels(cwd: string): Promise<ModelsData> {
       models: Object.fromEntries(nameMap),
       modelList,
       defaultModel,
+      defaultThinkingLevel,
+      savedDefaultThinkingLevel,
       thinkingLevels,
       thinkingLevelMaps: {},
       thinkingLevelPins,
@@ -80,6 +92,8 @@ const EMPTY_MODELS: ModelsData = {
   models: {},
   modelList: [],
   defaultModel: null,
+  defaultThinkingLevel: null,
+  savedDefaultThinkingLevel: null,
   thinkingLevels: {},
   thinkingLevelMaps: {},
   thinkingLevelPins: {},
@@ -88,7 +102,13 @@ const EMPTY_MODELS: ModelsData = {
 
 export async function GET(req: Request) {
   const requestedCwd = new URL(req.url).searchParams.get("cwd") || process.cwd();
-  const cwd = resolve(requestedCwd);
+  // A removed worktree (a finished subagent's) infers back to the repo it
+  // branched from, so its session lists the models that repo answers. The
+  // fallback grants nothing: the repo must already be an allowed root.
+  const resolved = resolve(requestedCwd);
+  const cwd = existsSync(resolved)
+    ? resolved
+    : inferRemovedWorktree(resolved)?.projectRoot ?? resolved;
 
   let cwdStat;
   try {

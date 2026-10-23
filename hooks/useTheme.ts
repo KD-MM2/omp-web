@@ -1,10 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { isDarkTheme, isThemePreference, type ThemePreference, type ResolvedTheme } from "@/lib/theme";
 import type { WebThemeConfig } from "@/lib/settings-api";
 
-export type ThemePreference = "light" | "dark" | "auto";
-export type ResolvedTheme = "light" | "dark";
+export type { ThemePreference, ResolvedTheme } from "@/lib/theme";
 
 type ThemeState = {
   preference: ThemePreference;
@@ -38,7 +38,7 @@ function getSystemTheme(): ResolvedTheme {
 function readStoredPreference(): ThemePreference {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
-    if (value === "light" || value === "dark" || value === "auto") return value;
+    if (isThemePreference(value)) return value;
     // Legacy omp-web key: a stored mode keeps meaning as that preference so
     // existing dark-mode users do not silently flip to auto on upgrade.
     const legacy = localStorage.getItem(THEME_MODE_KEY);
@@ -54,16 +54,18 @@ function resolveTheme(preference: ThemePreference): ResolvedTheme {
 }
 
 /**
- * Apply the resolved theme to the DOM: omp's palette CSS variables when the
- * theme config is loaded, the `.dark` class otherwise. The mode is also
- * persisted under the legacy key so the SSR bootstrap script paints the same
- * theme before hydration.
+ * Apply the resolved theme to the DOM: the `data-theme` attribute and `.dark`
+ * class from upstream's theme model, overlaid with omp's palette CSS
+ * variables when the omp theme config is loaded. The mode is also persisted
+ * under the legacy key so the SSR bootstrap script paints the same theme
+ * before hydration.
  */
-function applyOmpPalette(theme: ResolvedTheme): void {
+function applyDomTheme(theme: ResolvedTheme): void {
+  if (typeof document === "undefined") return;
   const root = document.documentElement;
   const palette = themeConfig?.palettes[theme];
-  root.dataset.ompThemeMode = theme;
-  root.classList.toggle("dark", palette ? palette.colorScheme === "dark" : theme === "dark");
+  root.dataset.theme = theme;
+  root.classList.toggle("dark", palette ? palette.colorScheme === "dark" : isDarkTheme(theme));
   if (palette) {
     for (const [name, value] of Object.entries(palette.variables)) {
       root.style.setProperty(name, value);
@@ -84,13 +86,13 @@ function ensureState(): ThemeState {
 
   const preference = readStoredPreference();
   const theme = resolveTheme(preference);
-  applyOmpPalette(theme);
+  applyDomTheme(theme);
   state = { preference, theme };
   return state;
 }
 
 function setThemeState(preference: ThemePreference, theme: ResolvedTheme, persist: boolean): void {
-  applyOmpPalette(theme);
+  applyDomTheme(theme);
   if (persist) {
     try {
       localStorage.setItem(STORAGE_KEY, preference);
@@ -159,7 +161,7 @@ export async function refreshOmpTheme(cwd?: string | null): Promise<void> {
   } catch {
     // The in-memory configuration still applies when storage is unavailable.
   }
-  applyOmpPalette(ensureState().theme);
+  applyDomTheme(ensureState().theme);
 }
 
 export function useTheme(options?: { cwd?: string | null; syncWithOmp?: boolean }) {
@@ -174,7 +176,7 @@ export function useTheme(options?: { cwd?: string | null; syncWithOmp?: boolean 
         const cached = localStorage.getItem(THEME_CONFIG_KEY);
         if (cached) {
           themeConfig = JSON.parse(cached) as WebThemeConfig;
-          applyOmpPalette(ensureState().theme);
+          applyDomTheme(ensureState().theme);
         }
       } catch {
         // Keep the built-in CSS fallback when neither endpoint nor cache works.
@@ -185,13 +187,13 @@ export function useTheme(options?: { cwd?: string | null; syncWithOmp?: boolean 
     };
   }, [options?.cwd, options?.syncWithOmp]);
 
-  const toggleTheme = useCallback((origin?: ToggleOrigin) => {
+  const setThemePreference = useCallback((nextPreference: ThemePreference, origin?: ToggleOrigin) => {
     const current = ensureState();
-    const nextPref = nextPreference(current.preference);
-    const nextTheme = resolveTheme(nextPref);
+    if (current.preference === nextPreference) return;
+    const nextTheme = resolveTheme(nextPreference);
 
     const apply = () => {
-      setThemeState(nextPref, nextTheme, true);
+      setThemeState(nextPreference, nextTheme, true);
     };
 
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -231,10 +233,18 @@ export function useTheme(options?: { cwd?: string | null; syncWithOmp?: boolean 
       });
   }, []);
 
+  // Fork quick-toggle: cycles light → dark → auto and animates through the
+  // same view-transition path as setThemePreference.
+  const toggleTheme = useCallback((origin?: ToggleOrigin) => {
+    const current = ensureState();
+    setThemePreference(nextPreference(current.preference), origin);
+  }, [setThemePreference]);
+
   return {
     theme: snapshot.theme,
     preference: snapshot.preference,
     toggleTheme,
-    isDark: snapshot.theme === "dark",
+    setThemePreference,
+    isDark: isDarkTheme(snapshot.theme),
   };
 }

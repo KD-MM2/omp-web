@@ -24,7 +24,7 @@ collect(ast);
 
 const callbackNames = [
   "closeEvents", "followSessionIdentity", "followRuntimeState", "cancelEventStreamGrace",
-  "handleExtensionUiRequest", "handleAgentEvent", "connectEvents", "ensureEventsConnected", "refreshContextUsage",
+  "handleExtensionUiRequest", "handleAgentEvent", "connectEvents", "ensureEventsConnected", "applyContextUsage", "refreshContextUsage",
 ];
 const helperNames = ["streamReducer", "EventStreamConnectionError"];
 for (const name of callbackNames) assert.ok(callbacks.has(name), `Missing callback: ${name}`);
@@ -90,6 +90,8 @@ function harness({ sessionId = "a", runtimeId = "runtime:r1" } = {}) {
     agentRunningRef: { current: false },
     sdkAgentActiveRef: { current: false },
     EVENT_STREAM_CONNECT_TIMEOUT_MS: 5_000,
+    sessionHookMountedRef: { current: true },
+    contextUsageAppliedIdRef: { current: 0 },
     opts: {},
     onSessionForked: (...args) => effects.push(["identity", ...args]),
     rememberSessionContinuation: (...args) => effects.push(["remember", ...args]),
@@ -97,8 +99,10 @@ function harness({ sessionId = "a", runtimeId = "runtime:r1" } = {}) {
     onAttentionNeeded: (request) => effects.push(["attention", request]),
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     clearTimeout: (id) => timers.delete(id),
+    // The fork polls the lightweight status URL (?systemPrompt=0); assertions track the path.
+    agentStatusUrl: (id) => `/api/agent/${encodeURIComponent(id)}?systemPrompt=0`,
     fetch: async (url) => {
-      requests.push(url);
+      requests.push(String(url).split("?")[0]);
       return replies.length ? replies.shift() : response({
         running: true,
         state: { sessionId: bindings.sessionIdRef.current, runtimeId: bindings.runtimeIdRef.current },
@@ -175,7 +179,9 @@ for (const initialId of ["a", "b"]) {
     assert.equal(promptStarted, true);
     assert.equal(h.bindings.runtimeIdRef.current, "runtime:r2");
     assert.equal(h.bindings.eventSourceRef.current, replacement);
-    assert.deepEqual(h.requests, ["/api/agent/runtime%3Ar1"]);
+    // The initial connected frame and the reconnected one each read usage too;
+    // the expiry discovery itself must be exactly one read of the old runtime.
+    assert.deepEqual(h.requests, ["/api/agent/runtime%3Ar1", "/api/agent/runtime%3Ar1", "/api/agent/runtime%3Ar2"]);
     assertOutputAndDialog(h, replacement);
   });
 }
@@ -517,7 +523,8 @@ for (const handshakeComplete of [false, true]) {
     h.replies.push(response({ running: true, state: { sessionId: "b", runtimeId: "runtime:r2" } }));
     await h.refreshContextUsage("b");
     await tick();
-    assert.deepEqual(h.requests, ["/api/agent/runtime%3Ar1"]);
+    // A completed handshake reads usage on connect; the discovery read follows.
+    assert.deepEqual(h.requests, handshakeComplete ? ["/api/agent/runtime%3Ar1", "/api/agent/runtime%3Ar1"] : ["/api/agent/runtime%3Ar1"]);
     assert.equal(current.readyState, 2);
     assert.equal(h.bindings.eventSourceRef.current, null);
     assert.equal(h.bindings.runtimeIdRef.current, "runtime:r2");

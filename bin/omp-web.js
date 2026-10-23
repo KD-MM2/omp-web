@@ -29,7 +29,7 @@ const path = require("path");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const fs = require("fs");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { parseLaunchOptions } = require("./omp-web-options");
+const { parseCommandLine, getHelpText } = require("./omp-web-options");
 const {
   getWebAuthStatus,
   resolveWebAuthFile,
@@ -63,7 +63,20 @@ try {
 }
 
 
-const { port, hostname, openBrowser, authenticated, resetPassword } = parseLaunchOptions();
+const launch = parseCommandLine();
+
+// `omp-web version` / `--help` must answer even without build artifacts.
+if (launch.command === "version") {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  console.log(require(path.join(pkgDir, "package.json")).version);
+  process.exit(0);
+}
+if (launch.help) {
+  console.log(getHelpText());
+  process.exit(0);
+}
+
+const { port, hostname, openBrowser, authenticated, resetPassword } = launch;
 const loopbackHostnames = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 // Resolved once here and handed to the server through the environment, so the
 // launcher and the Next.js process can never disagree about which credential

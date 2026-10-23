@@ -1,12 +1,15 @@
 "use client";
 
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import SyntaxHighlighter from "react-syntax-highlighter/dist/esm/prism-light";
 import { vs } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { useTheme } from "@/hooks/useTheme";
 import { useI18n } from "@/hooks/useI18n";
+import { usePrismLanguages } from "@/hooks/usePrismLanguages";
 import { copyText } from "@/lib/clipboard";
+import { takeHighlightBudget, waitForHighlight } from "@/lib/highlight-queue";
+import { prismLanguagesLoaded } from "@/lib/prism-languages";
 
 interface MermaidBlockProps {
   code: string;
@@ -17,6 +20,17 @@ interface MermaidBlockProps {
 const ZOOM_STEP = 0.25;
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 3;
+
+export function downloadMermaidSvg(svg: SVGSVGElement): void {
+  // Mermaid's HTML serialization can leave void tags such as <br> unclosed.
+  const xml = new XMLSerializer().serializeToString(svg);
+  const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "mermaid-diagram.svg";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 type RenderState =
   | { key: string; status: "loading" }
@@ -29,6 +43,7 @@ export function MermaidBlock({ code, isStreaming, defaultPreview = false }: Merm
   const [showPreview, setShowPreview] = useState(defaultPreview);
   const [renderState, setRenderState] = useState<RenderState | null>(null);
   const [zoomOpen, setZoomOpen] = useState(false);
+  const previewRef = useRef<HTMLButtonElement>(null);
   const currentKey = `${isDark ? "dark" : "light"}\n${code}`;
   const previewVisible = showPreview && !isStreaming;
 
@@ -93,6 +108,7 @@ export function MermaidBlock({ code, isStreaming, defaultPreview = false }: Merm
       <>
         {!zoomOpen && (
           <button
+            ref={previewRef}
             type="button"
             className="mermaid-block mermaid-preview-button"
             title={t("i18n.openMermaidViewer")}
@@ -109,7 +125,23 @@ export function MermaidBlock({ code, isStreaming, defaultPreview = false }: Merm
     <div className="markdown-code-block">
       <div className="markdown-code-header">
         <span className="markdown-code-lang">mermaid</span>
-        {previewButton}
+        <div className="markdown-code-actions">
+          {renderState?.key === currentKey && renderState.status === "ready" && (
+            <button
+              type="button"
+              className="markdown-code-action"
+              title={`${t("i18n.downloadFile")} (SVG)`}
+              aria-label={`${t("i18n.downloadFile")} (SVG)`}
+              onClick={() => {
+                const svg = previewRef.current?.querySelector("svg");
+                if (svg) downloadMermaidSvg(svg);
+              }}
+            >
+              SVG
+            </button>
+          )}
+          {previewButton}
+        </div>
       </div>
       {body}
     </div>
@@ -227,6 +259,17 @@ interface CodeBlockProps {
   isStreaming?: boolean;
 }
 
+// Prism's light theme uses backgroundColor, while its dark theme uses the
+// background shorthand. Keep the pre background solely in customStyle so a
+// theme switch cannot remove/update one and reset the other in React's diff.
+const codeBlockDarkTheme = {
+  ...vscDarkPlus,
+  'pre[class*="language-"]': {
+    ...vscDarkPlus['pre[class*="language-"]'],
+  },
+};
+delete codeBlockDarkTheme['pre[class*="language-"]'].background;
+
 /**
  * Syntax-highlighted code block with copy button.
  * Used as the "source" view for mermaid blocks and for all non-mermaid code fences.
@@ -236,11 +279,26 @@ interface CodeBlockProps {
  * While the owning message is still streaming, the block renders as plain
  * monospace text — highlighting a growing block re-tokenizes all of it on
  * every chunk, which is the single most expensive part of streamed rendering.
+ * A finished block past this task's highlight budget (lib/highlight-queue.ts),
+ * or mounted before the Prism languages have loaded (lib/prism-languages.ts),
+ * renders through the same highlighter as `text` (same lines, numbers and
+ * box, no tokens) until an idle slice lets it take its language.
  */
 export const CodeBlock = memo(function CodeBlock({ code, lang, headerAction, isStreaming }: CodeBlockProps) {
   const { isDark } = useTheme();
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  // Loading starts with the first block, streaming or not, so a streamed
+  // reply usually finds the languages ready when it ends.
+  const languagesReady = usePrismLanguages();
+  const [highlighted, setHighlighted] = useState(
+    () => !isStreaming && prismLanguagesLoaded() && takeHighlightBudget(code.length),
+  );
+
+  useEffect(() => {
+    if (isStreaming || highlighted || !languagesReady) return;
+    return waitForHighlight(() => setHighlighted(true));
+  }, [isStreaming, highlighted, languagesReady]);
 
   const copy = () => {
     copyText(code).then(() => {
@@ -268,29 +326,33 @@ export const CodeBlock = memo(function CodeBlock({ code, lang, headerAction, isS
           style={{
             margin: 0,
             padding: "11px 13px",
-            fontSize: 12.5,
+            fontSize: "calc(12.5px + var(--chat-font-size-offset, 0px))",
             lineHeight: 1.62,
             overflowX: "auto",
-            background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
+            backgroundColor: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
           }}
         >
           <code style={{ fontFamily: "var(--font-mono)" }}>{code}</code>
         </pre>
       ) : (
         <SyntaxHighlighter
-          language={lang || "text"}
-          style={isDark ? vscDarkPlus : vs}
+          language={highlighted ? lang || "text" : "text"}
+          style={isDark ? codeBlockDarkTheme : vs}
           showLineNumbers
           lineNumberStyle={{ color: "var(--text-dim)", fontStyle: "normal" }}
           customStyle={{
             margin: 0,
             padding: "11px 13px",
-            fontSize: 12.5,
+            fontSize: "calc(12.5px + var(--chat-font-size-offset, 0px))",
             lineHeight: 1.62,
+            fontWeight: "var(--font-mono-weight)",
+            // The light `vs` theme puts its own 1px #ddd border on <pre>; the
+            // block's wrapper already draws the frame.
+            border: "none",
             borderRadius: 0,
-            background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
+            backgroundColor: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
           }}
-          codeTagProps={{ style: { fontFamily: "var(--font-mono)" } }}
+          codeTagProps={{ style: { fontFamily: "var(--font-mono)", fontWeight: "var(--font-mono-weight)" } }}
         >
           {code}
         </SyntaxHighlighter>

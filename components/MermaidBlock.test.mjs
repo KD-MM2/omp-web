@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { MermaidBlock, CodeBlock } = await jiti.import("./MermaidBlock.tsx");
-const { I18nProvider } = await jiti.import("../hooks/useI18n.tsx");
+const React = await jiti.import("react");
+const { renderToStaticMarkup } = await jiti.import("react-dom/server");
+const { MermaidBlock, CodeBlock, downloadMermaidSvg } = await jiti.import("./MermaidBlock.tsx");
+const { I18nProvider } = await jiti.import("@/hooks/useI18n");
+const { loadPrismLanguages } = await jiti.import("@/lib/prism-languages");
 
 // Simple sequenceDiagram for testing
 const mermaidSrc = `sequenceDiagram
@@ -68,13 +69,31 @@ function renderCode(props) {
   );
 }
 
-test("CodeBlock highlights code when not streaming", () => {
+test("CodeBlock renders the same numbered lines without tokens until the Prism languages load", () => {
+  const html = renderCode({ code: "const x = 1;\nlet y = 2;", lang: "javascript" });
+
+  assert.doesNotMatch(html, /class="token/);
+  assert.equal(html.match(/react-syntax-highlighter-line-number/g)?.length, 2);
+  assert.match(html, /const x = 1;/);
+});
+
+test("CodeBlock highlights code when not streaming", async () => {
+  await loadPrismLanguages();
   const html = renderCode({ code: "const x = 1;", lang: "javascript" });
 
   assert.match(html, /class="token/);
   assert.match(html, /const/);
 });
 
+test("CodeBlock owns the pre background without a competing shorthand", () => {
+  for (const isStreaming of [false, true]) {
+    const html = renderCode({ code: "const x = 1;", lang: "javascript", isStreaming });
+    const pre = html.match(/<pre\b[^>]*>/)?.[0];
+    assert.ok(pre);
+    assert.match(pre, /background-color:color-mix/);
+    assert.doesNotMatch(pre, /(?:[;\"]|^)background:/);
+  }
+});
 test("CodeBlock renders plain text without tokenization while streaming", () => {
   const html = renderCode({ code: "const x = 1;", lang: "javascript", isStreaming: true });
 
@@ -91,4 +110,46 @@ test("MermaidBlock handles Chinese characters in diagram", () => {
 
   assert.doesNotMatch(html, /mermaid-block-error/);
   assert.match(html, /mermaid-block/);
+});
+
+test("downloadMermaidSvg downloads XML-serialized SVG and releases its URL", async () => {
+  const originalDocument = globalThis.document;
+  const originalXMLSerializer = globalThis.XMLSerializer;
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  const svgElement = { nodeName: "svg" };
+  const serializedSvg = '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div xmlns="http://www.w3.org/1999/xhtml">first<br />second</div></foreignObject></svg>';
+  const link = { href: "", download: "", clicked: false, click() { this.clicked = true; } };
+  let downloadedBlob;
+  globalThis.document = { createElement: () => link };
+  globalThis.XMLSerializer = class {
+    serializeToString(element) {
+      assert.equal(element, svgElement);
+      return serializedSvg;
+    }
+  };
+  URL.createObjectURL = (blob) => {
+    assert.equal(blob.type, "image/svg+xml;charset=utf-8");
+    downloadedBlob = blob;
+    return "blob:mermaid";
+  };
+  let revoked = null;
+  URL.revokeObjectURL = (url) => { revoked = url; };
+
+  try {
+    downloadMermaidSvg(svgElement);
+    assert.equal(await downloadedBlob.text(), serializedSvg);
+    assert.equal(link.href, "blob:mermaid");
+    assert.equal(link.download, "mermaid-diagram.svg");
+    assert.equal(link.clicked, true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(revoked, "blob:mermaid");
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+    if (originalXMLSerializer === undefined) delete globalThis.XMLSerializer;
+    else globalThis.XMLSerializer = originalXMLSerializer;
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+  }
 });
