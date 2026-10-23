@@ -500,7 +500,7 @@ test("offers the downstream context-menu hook only on a normal session row", () 
   assert.match(source, /const handleContextMenu[\s\S]*?dispatchSessionRowContextMenu\(\{/);
   assert.match(
     source,
-    /if \(session\.id === renamingRootId \|\| session\.id === confirmDeleteRootId\) return;/,
+    /if \(session\.id === renamingRootId \|\| session\.id === confirmDeleteRootId \|\| session\.id === confirmForkRootId\) return;/,
   );
   assert.match(source, /onRowContextMenu: handleContextMenu,/);
 });
