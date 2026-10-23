@@ -2,18 +2,22 @@ export const SETTINGS_SECTION_VALUES = [
   "general",
   "models",
   "skills",
+  "agents",
   "plugins",
+  "mcp",
 ] as const;
 
 export type SettingsSection = (typeof SETTINGS_SECTION_VALUES)[number];
 export type SettingsDetailSection = Exclude<SettingsSection, "general">;
 
 const STORAGE_KEY = "pi-web:settings-navigation";
-const PROJECT_SECTIONS = { skills: true, plugins: true } as const;
+// Sections that need a project to show anything. Settings › MCP is not one: it
+// lists the global mcp.json without a project and adds a Project group with one.
+const PROJECT_SECTIONS = new Set<SettingsSection>(["skills", "agents", "plugins"]);
 
 /** Whether a section is unavailable until a project is open. */
 export function settingsSectionRequiresProject(section: SettingsSection): boolean {
-  return section in PROJECT_SECTIONS;
+  return PROJECT_SECTIONS.has(section);
 }
 
 interface StorageLike {
@@ -62,7 +66,10 @@ function readState(storage: StorageLike): SettingsNavigationState {
 
 function selectionKey(section: SettingsDetailSection, cwd?: string | null): string | null {
   if (section === "models") return section;
-  return cwd ? JSON.stringify([section, cwd]) : null;
+  if (cwd) return JSON.stringify([section, cwd]);
+  // MCP works without a project; its selection then lives under the bare name,
+  // which no project key (always an array) can collide with.
+  return section === "mcp" ? section : null;
 }
 
 export function getLastSettingsSection(
