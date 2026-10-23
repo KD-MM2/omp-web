@@ -416,6 +416,17 @@ export class AgentSessionWrapper {
   private agentRunNeedsCompletion = false;
   // The last settled run was stopped, not finished: nothing to announce.
   private lastRunAborted = false;
+  // The most recently admitted prompt's text and admission time. The web client
+  // has several accidental double-submit windows (composer remount during the
+  // new-session transition, a second tab, a re-tap while ambiguous-send recovery
+  // still holds the text). A second copy of the same user message lands adjacent
+  // to the first in session history and rewrites the provider request at that
+  // position, invalidating the KV cache prefix for everything after it.
+  private lastAcceptedPrompt: { text: string; at: number } | null = null;
+  // How long after a clean settle an identical resubmission still counts as the
+  // same accidental send. After a stop or rejection the same text is a deliberate
+  // retry and must pass.
+  private promptDedupWindowMs = 12_000;
   // Set while the handoff RPC is in flight so state polls and the running-set
   // stay honest during the long oneshot generation + session transition.
   private handoffRunning = false;
@@ -1121,6 +1132,40 @@ export class AgentSessionWrapper {
     this.applyForcedEmptySystemPrompt();
   }
 
+  private isPromptInFlight(): boolean {
+    return this.pendingPromptCount > 0 || this.promptRunning || this.inner.isStreaming;
+  }
+
+  /**
+   * True when this text is a copy of the last admitted prompt that is still
+   * relevant: the original is in flight, or it settled cleanly within the dedup
+   * window. Retries after a stop are deliberately not duplicates.
+   */
+  private isDuplicatePromptSubmission(text: string): boolean {
+    const last = this.lastAcceptedPrompt;
+    if (!last || last.text !== text) return false;
+    // A stop voids the fingerprint outright (see case "abort"), so a resend
+    // after Stop is never treated as the accidental copy here.
+    if (this.isPromptInFlight()) return true;
+    return Date.now() - last.at <= this.promptDedupWindowMs;
+  }
+
+  /** True when the SDK's steering/follow-up queue already holds this exact text. */
+  private isQueuedText(text: string): boolean {
+    const queueSource = this.inner as unknown as {
+      getQueuedMessages?: () => { steering: Iterable<string>; followUp: Iterable<string> };
+      getSteeringMessages?: () => Iterable<string>;
+      getFollowUpMessages?: () => Iterable<string>;
+    };
+    const queued = queueSource.getQueuedMessages?.() ?? {
+      steering: queueSource.getSteeringMessages?.() ?? [],
+      followUp: queueSource.getFollowUpMessages?.() ?? [],
+    };
+    for (const queuedText of queued.steering) if (queuedText === text) return true;
+    for (const queuedText of queued.followUp) if (queuedText === text) return true;
+    return false;
+  }
+
   async send(command: Record<string, unknown>): Promise<unknown> {
     const type = command.type as string;
     // Status reconciliation must not postpone forced cleanup after Stop.
@@ -1159,11 +1204,19 @@ export class AgentSessionWrapper {
           if (this.extensionUiAbortController.signal.aborted) {
             this.extensionUiAbortController = new AbortController();
           }
+          const message = command.message as string;
+          const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
+          // Double-submit guard: the same text arriving while its first copy is
+          // in flight or queued — or within the dedup window after a clean
+          // settle — is the accidental second send, not a new instruction.
+          // Accept it silently instead of appending a second copy to history.
+          if (this.isDuplicatePromptSubmission(message) || this.isQueuedText(message)) {
+            return { deduplicated: true };
+          }
           // A turn the operator asked for means the next continuation is wanted,
           // and supersedes one already scheduled.
           this.goalMode.onUserPrompt();
           const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-          const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
           let preflightAccepted = false;
           let preflightSettled = false;
           let promptSettled = false;
@@ -1195,9 +1248,9 @@ export class AgentSessionWrapper {
 
           this.pendingPromptCount += 1;
           notifyRunningChange();
-          const message = command.message as string;
           let prompt: Promise<unknown>;
           try {
+            this.lastAcceptedPrompt = { text: message, at: Date.now() };
             prompt = this.inner.prompt(message, {
               ...(promptImages?.length ? { images: promptImages } : {}),
               ...(streamingBehavior ? { streamingBehavior } : {}),
@@ -1212,6 +1265,7 @@ export class AgentSessionWrapper {
               onPromptAdmitted: () => acceptPreflight(),
             });
           } catch (error) {
+            if (this.lastAcceptedPrompt?.text === message) this.lastAcceptedPrompt = null;
             finishPrompt();
             throw error;
           }
@@ -1236,6 +1290,7 @@ export class AgentSessionWrapper {
                 return;
               }
             }
+            if (this.lastAcceptedPrompt?.text === message) this.lastAcceptedPrompt = null;
             rejectPreflight(error);
             finishPrompt();
             invalidateSessionListCache();
@@ -1270,6 +1325,10 @@ export class AgentSessionWrapper {
         // Stop must unwind extension commands that have not started the agent yet.
         this.extensionUiAbortController.abort(new DOMException("Extension UI cancelled by Stop", "AbortError"));
         this.goalMode.onAbort();
+        // Stop voids the prompt dedup fingerprint: a resend while the stopped
+        // run unwinds is deliberate. (`lastRunAborted` cannot carry that: the
+        // compat `acceptPreflight` fallback resets it to false on resolve.)
+        this.lastAcceptedPrompt = null;
         try {
           await this.withFinalRunningNotification(async () => {
             try {
@@ -1533,14 +1592,22 @@ export class AgentSessionWrapper {
       }
 
       case "steer": {
+        const steerText = command.message as string;
+        if (this.isDuplicatePromptSubmission(steerText) || this.isQueuedText(steerText)) {
+          return { deduplicated: true };
+        }
         const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.steer(command.message as string, steerImages?.length ? steerImages : undefined);
+        await this.inner.steer(steerText, steerImages?.length ? steerImages : undefined);
         return null;
       }
 
       case "follow_up": {
+        const followText = command.message as string;
+        if (this.isDuplicatePromptSubmission(followText) || this.isQueuedText(followText)) {
+          return { deduplicated: true };
+        }
         const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.followUp(command.message as string, followImages?.length ? followImages : undefined);
+        await this.inner.followUp(followText, followImages?.length ? followImages : undefined);
         return null;
       }
 
