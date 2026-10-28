@@ -79,7 +79,7 @@ app/api/
   auth/providers/route.ts         GET OAuth provider list
   cwd/validate/route.ts           POST validate/select a cwd
   default-cwd/route.ts            POST create ~/omp-cwd-YYYYMMDD
-  files/[...path]/route.ts        GET file contents for viewer
+  files/[...path]/route.ts        GET file contents for viewer | POST uploads
   home/route.ts                   GET user home directory
   model-roles/route.ts            GET/PUT omp's modelRoles record
   models/route.ts                 GET { models, modelList, defaultModel, roles }
@@ -93,12 +93,18 @@ app/api/
   web-access/route.ts             GET/PUT the password lock (settings -> Access)
   web-access/recovery/route.ts    POST recovery code request/redeem (unauthenticated)
   worktrees/route.ts              GET/POST/DELETE git worktrees
+  push/config/route.ts            GET VAPID public key
+  push/subscribe/route.ts         POST register a web-push subscription
+  terminal/route.ts               POST create a shell terminal session
+  terminal/[id]/route.ts          GET session info | POST input/resize | DELETE kill
+  terminal/[id]/events/route.ts   GET SSE stream
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
+  file-upload-client.ts browser upload to /api/files, shared by explorer and chat drops
   markdown.ts          shared markdown helpers
   model-roles.ts       omp's model roles, read/written for the browser
   model-scope.ts       enabledModels resolution shared by UI and startup
@@ -106,10 +112,14 @@ lib/
   omp-runtime.ts       shared Settings + AuthStorage + ModelRegistry
   omp-types.ts         structural view of omp's AgentSession
   project-trust.ts     gates a project's executable resources
+  push-client.ts       browser push subscription helpers
+  web-push.ts          VAPID keys + web-push notification sending
   rpc-manager.ts       AgentSessionWrapper + registry + startRpcSession
   session-reader.ts    session listing + path cache + buildSessionContext adapter
   session-system-prompt.ts  SYSTEM.md / APPEND_SYSTEM.md resolution per session cwd
   session-title.ts     thin wrapper over omp's own title generator
+  terminal-client.ts   browser side of /api/terminal (create, input, SSE)
+  terminal-manager.ts  server-side PTY sessions with connection leases
   tool-presets.ts      PRESET_NONE/DEFAULT/FULL + getPresetFromTools()
   types.ts             shared TypeScript types
   normalize.ts         normalizeToolCalls() — field name mismatch between file format and our types
@@ -123,7 +133,6 @@ components/
   ChatInput.tsx       input bar + model/role/thinking/tools/compact controls
   MessageView.tsx     renders one message (user/assistant/toolCall/toolResult)
   BranchNavigator.tsx in-session branch switcher
-  ChatMinimap.tsx     scroll minimap alongside the message list
   MarkdownBody.tsx    markdown renderer
   ModelsConfig.tsx    modal for providers/auth (opened from sidebar bottom)
   ModelRolesPanel.tsx per-role model assignment inside that modal
@@ -132,6 +141,7 @@ components/
   FileExplorer.tsx    file tree inside sidebar
   FileIcons.tsx       file icon helpers
   FileViewer.tsx      file content in a tab
+  TerminalPanel.tsx   terminal tab in the right-hand file panel
   TabBar.tsx          tab bar (Chat + open file tabs)
 
 hooks/
@@ -140,6 +150,7 @@ hooks/
   useDragDrop.ts      shared drag/drop state
   useIsMobile.ts      responsive breakpoint hook
   useTheme.ts         theme state
+  useTerminalTheme.ts terminal's own dark/light choice (localStorage)
 ```
 
 ---
@@ -263,7 +274,9 @@ Newer omp emits `compaction_start` / `compaction_end`; older versions emitted `a
 - `/api/cwd/validate`, `/api/default-cwd`, and `/api/worktrees` call `allowFileRoot()` when they make a new location browsable.
 
 ### Plugins and skills
-- `/api/plugins` drives omp's `PluginManager` (`~/.omp/plugins`): install, uninstall, enable/disable, plus `doctor()` output as diagnostics. omp has no in-place update, so "update" reinstalls the spec with `force`.
+- `/api/plugins` lists and toggles pi's package list: the `packages` key of `~/.omp/agent/settings.json` (global scope) and of the project's own `settings.json` (`.omp/`, falling back to a legacy `.pi/`). A package is disabled by emptying its four resource lists, and enabling restores the entry minus those lists, so `autoload` and hand-written filters survive a toggle (`lib/plugin-package-settings.ts` owns that storage; omp's own `Settings` has no package list).
+- `/api/plugins` install/remove/update still drive omp's `PluginManager` (`~/.omp/plugins`), which has no in-place update, so "update" reinstalls the spec with `force`. `canCheckForUpdates` comes from `lib/plugin-updates.ts`, and `npm:` sources resolve their install under `~/.omp/plugins/node_modules`.
+- Top-level modules under `~/.omp/agent/extensions` (and a trusted project's `.omp/extensions`) are reported as `standaloneExtensions`, `enabled` following omp's own `disabledExtensions` ids (`extension-module:<name>`) from `settings.json`/`config.yml`. Project-scope writes need an explicit trust decision even when the folder only ships a `settings.json`, which omp-web's session gate alone would wave through.
 - `/api/skills` uses omp's own `loadSkills()`, so `.omp/skills`, `~/.omp/agent/skills`, `.claude/skills`, plugin skills and `.agents/skills` are listed exactly as a session sees them.
 - Skill toggling edits only the `disable-model-invocation` frontmatter key on the target `SKILL.md`; keep that surgical so user formatting survives.
 - `/api/skills/install` shells through `npx skills add ... --agent claude-code`. The `skills` CLI has no `omp` agent, and its `pi` agent writes `~/.pi/agent/skills`, which omp does **not** read; the Claude layout is discovered by default.
@@ -317,6 +330,11 @@ never proxies loopback — which is what local providers need. It ignores
 `EnvHttpProxyAgent` path only exists for a dev server run on Node, because Bun
 resolves `undici` to its own shim where `setGlobalDispatcher` does not affect
 `fetch` and `install` does not exist.
+
+## Old Safari (iOS 16.2)
+
+- `/` renders entirely on the client, so one script chunk the browser cannot parse is a blank page. Next 16 targets Safari 16.4+; the `browserslist` in `package.json` lowers Safari and iOS to 16.2 so SWC turns class `static {}` blocks into private static fields. That covers Next's client runtime; other node_modules keep their syntax unless listed in `transpilePackages` (mermaid and `@mermaid-js/parser` are, for their lazy diagram chunks). Keep the other browserslist entries at Next's defaults.
+- Never write a RegExp lookbehind (`(?<=`, `(?<!`) in client code: SWC cannot downlevel it and Safari parses it only from 16.4. `lib/markdown.ts` emulates its leading lookbehinds with `replaceNotPrecededBy()`. A lookbehind built at runtime (`new RegExp("(?<=…)")` in `try`) fails only when run; that is how `lib/gfm-autolink-email-loader.cjs` fixes `mdast-util-gfm-autolink-literal`'s email regex. The loader is registered for webpack and Turbopack in `next.config.ts` and fails the build if that regex changes upstream.
 
 ## omp Session File Format
 

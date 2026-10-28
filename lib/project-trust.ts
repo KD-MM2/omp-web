@@ -86,13 +86,25 @@ export function hasTrustRequiringProjectResources(cwd: string): boolean {
   return false;
 }
 
+/**
+ * The decision this store records for `cwd` itself. The fork's JSON store keys
+ * decisions per canonical folder and never inherits from an ancestor, so
+ * `inherited` is always false and `decisionPath` is the key the decision sits at.
+ */
+function describeDecision(agentDir: string, cwd: string): Pick<ProjectTrustStatus, "decision" | "decisionPath" | "inherited"> {
+  const recorded = readTrustedProjects(agentDir)[canonicalProjectKey(cwd)];
+  if (recorded === undefined) return { decision: null, inherited: false };
+  return { decision: recorded, decisionPath: canonicalProjectKey(cwd), inherited: false };
+}
+
 export function getProjectTrustStatus(cwd: string, agentDir: string): ProjectTrustStatus {
   const requiresTrust = Boolean(cwd) && hasTrustRequiringProjectResources(cwd);
-  if (!requiresTrust) return { requiresTrust: false, trusted: true };
+  if (!requiresTrust) return { requiresTrust: false, trusted: true, decision: null, inherited: false };
 
   return {
     requiresTrust: true,
     trusted: readTrustedProjects(agentDir)[canonicalProjectKey(cwd)] === true,
+    ...describeDecision(agentDir, cwd),
   };
 }
 
@@ -103,7 +115,23 @@ export function trustProject(cwd: string, agentDir: string): ProjectTrustStatus 
   const trusted = readTrustedProjects(agentDir);
   trusted[canonicalProjectKey(cwd)] = true;
   writeTrustedProjects(agentDir, trusted);
-  return { requiresTrust: true, trusted: true };
+  return { requiresTrust: true, trusted: true, decision: true, decisionPath: canonicalProjectKey(cwd), inherited: false };
+}
+
+/**
+ * Reload options that keep an untrusted project's extensions dormant: the
+ * resource loader imports project extensions once the resolver answers true.
+ * Returns `undefined` when the project has no trust-requiring resources,
+ * leaving ordinary projects on their existing load path.
+ */
+export function projectTrustReloadOptions(
+  cwd: string,
+  agentDir: string,
+): { resolveProjectTrust: () => Promise<boolean> } | undefined {
+  if (!cwd || !hasTrustRequiringProjectResources(cwd)) return undefined;
+  return {
+    resolveProjectTrust: async () => readTrustedProjects(agentDir)[canonicalProjectKey(cwd)] === true,
+  };
 }
 
 /** True when `candidate` lives inside `root` (or is `root` itself). */

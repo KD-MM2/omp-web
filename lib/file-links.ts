@@ -1,3 +1,21 @@
+interface LocalFileClickEvent {
+  defaultPrevented: boolean;
+  button: number;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+}
+
+export function shouldOpenLocalFileInApp(event: LocalFileClickEvent): boolean {
+  // Browsers block file:// navigation from Pi Web's HTTP origin, so the
+  // platform primary modifier must use the same in-app preview as a plain click.
+  return !event.defaultPrevented
+    && event.button === 0
+    && !event.shiftKey
+    && !event.altKey;
+}
+
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
@@ -98,7 +116,8 @@ export function resolveLocalFileHref(
   }
 
   if (lowerHref.startsWith("file:")) {
-    candidate = fileUrlToPath(normalizedHref);
+    // Decode only the parsed pathname so encoded delimiters stay in the filename.
+    candidate = fileUrlToPath(cleanHref);
     candidateKind = candidate ? "absolute" : null;
   } else if (/^[a-zA-Z]:\//.test(normalizedHref)) {
     candidate = normalizedHref;
@@ -118,6 +137,24 @@ export function resolveLocalFileHref(
   return filePath;
 }
 
+const PDF_PAGE_FRAGMENT = /^page=(\d+)$/i;
+
+/**
+ * Read the PDF Open Parameters page selector (`#page=12`) from a markdown href.
+ *
+ * Only the `page` fragment is understood; every other fragment is ignored so
+ * that unknown anchors keep their previous behaviour. Returns null when the href
+ * has no usable page fragment.
+ */
+export function parsePdfPageFragment(href: string | undefined): number | null {
+  if (!href) return null;
+  const hashIndex = href.indexOf("#");
+  if (hashIndex === -1) return null;
+  const match = href.slice(hashIndex + 1).trim().match(PDF_PAGE_FRAGMENT);
+  if (!match) return null;
+  const page = Number.parseInt(match[1], 10);
+  return Number.isInteger(page) && page > 0 ? page : null;
+}
 /** Resolve a filesystem path without applying URL or source-location syntax. */
 export function resolveLocalFilePath(filePath: string | undefined, baseDir?: string): string | null {
   if (!filePath) return null;

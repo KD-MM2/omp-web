@@ -10,6 +10,7 @@ import {
   buildSessionContext,
   getHistoricalContextUsage,
   readSessionHeader,
+  CONTEXT_DEFAULT_TAIL,
 } from "@/lib/session-reader";
 import { sessionPathKey } from "@/lib/session-path";
 import { setSessionArchived } from "@/lib/session-archive";
@@ -43,7 +44,11 @@ export async function GET(
     const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
-    const context = buildSessionContext(entries, leafId, { deferThinking, deferToolResultImages });
+    // Bounded like /context: an initial open must never serialize the whole
+    // branch (mobile OOM); the client pages upward from `oldestEntryId`.
+    const rawTail = Number(searchParams.get("tail"));
+    const tail = Math.min(Number.isFinite(rawTail) && rawTail > 0 ? rawTail : CONTEXT_DEFAULT_TAIL, 1000);
+    const context = buildSessionContext(entries, leafId, { deferThinking, deferToolResultImages, tail });
     // A runtime fallback can differ from the last persisted model selector.
     if (liveRpc?.inner.model) {
       context.model = { provider: liveRpc.inner.model.provider, modelId: liveRpc.inner.model.id };

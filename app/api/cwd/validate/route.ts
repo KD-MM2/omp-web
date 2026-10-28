@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { realpathSync, statSync } from "fs";
 import { allowFileRoot } from "@/lib/file-access";
 import { normalizeDirectory } from "@/lib/directory-browser";
+import { projectIdentityKey } from "@/lib/project-identity";
+import { resolveProject } from "@/lib/worktree";
 
 
 // POST /api/cwd/validate  body: { cwd: string }
@@ -28,7 +30,15 @@ export async function POST(req: Request) {
     }
 
     allowFileRoot(canonicalCwd);
-    return NextResponse.json({ success: true, cwd: canonicalCwd });
+    // The UI keys worktree grouping and authorization scope on the server's
+    // own project identity, not on the path it happened to send.
+    const project = await resolveProject(canonicalCwd);
+    return NextResponse.json({
+      success: true,
+      cwd: canonicalCwd,
+      projectRoot: project.projectRoot,
+      projectKey: projectIdentityKey(project.projectRoot),
+    });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

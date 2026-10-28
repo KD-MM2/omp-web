@@ -20,28 +20,35 @@ interface Props {
   hasSession?: boolean;
   /** When inline, render icon-only (no text label) to save horizontal space */
   compact?: boolean;
+  /** Keep the inline dropdown mounted while another control supplies its trigger */
+  hideInlineButton?: boolean;
+  /** The session is running: the tree stays readable but branches cannot be switched */
+  locked?: boolean;
 }
 
 // Find the visible entry IDs on the path from root to activeLeafId.
-function buildActivePath(nodes: SessionTreeNode[], targetId: string | null): Set<string> {
+// Iterative DFS: a linear session degrades into a chain whose depth equals the
+// entry count, so a recursive search overflows the call stack. Walk with an
+// explicit stack instead (paths accumulate depth, not the call stack).
+export function buildActivePath(nodes: SessionTreeNode[], targetId: string | null): Set<string> {
   if (!targetId) return new Set();
   const target = targetId;
-  function search(nodes: SessionTreeNode[], path: string[]): string[] | null {
-    for (const node of nodes) {
-      const next = [...path, node.entry.id];
-      if (node.entry.id === target || node.compressedEntryIds?.includes(target)) {
-        return next;
-      }
-      const found = search(node.children, next);
-      if (found) return found;
+  const stack: { node: SessionTreeNode; path: string[] }[] = nodes.map((n) => ({ node: n, path: [n.entry.id] }));
+  while (stack.length > 0) {
+    const { node, path } = stack.pop()!;
+    if (node.entry.id === target || node.compressedEntryIds?.includes(target)) {
+      return new Set(path);
     }
-    return null;
+    for (const child of node.children) {
+      stack.push({ node: child, path: [...path, child.entry.id] });
+    }
   }
-  return new Set(search(nodes, []) ?? []);
+  return new Set();
 }
 
+// Transcript system messages hold the prompt, not a turn, so they never label a branch.
 function isMessageEntry(entry: SessionEntry): boolean {
-  return entry.type === "message" && "message" in entry;
+  return entry.type === "message" && "message" in entry && entry.message.role !== "system";
 }
 
 // Compress a visible linear chain into the first branching/leaf node.
@@ -78,7 +85,7 @@ export function selectTopLevelBranches(tree: SessionTreeNode[]): SessionTreeNode
 }
 
 function getLabel(entry: SessionEntry): string {
-  if (entry.type === "message" && "message" in entry) {
+  if (entry.type === "message" && isMessageEntry(entry)) {
     const msg = entry.message as { role: string; content: unknown };
     const content = msg.content;
     let text = "";
@@ -97,12 +104,16 @@ function getLabel(entry: SessionEntry): string {
   return entry.type;
 }
 
-// Does the tree have any branching at all?
-function hasBranch(nodes: SessionTreeNode[]): boolean {
+// Does the tree have any branching at all? Iterative: a linear chain has no
+// branching but recursing over it would overflow the stack, so walk with a stack.
+export function hasSessionBranches(nodes: SessionTreeNode[]): boolean {
+  // Sessions branched from the very first message have multiple root nodes.
   if (nodes.length > 1) return true;
-  for (const node of nodes) {
+  const stack: SessionTreeNode[] = [...nodes];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
     if (node.children.length > 1) return true;
-    if (hasBranch(node.children)) return true;
+    for (const child of node.children) stack.push(child);
   }
   return false;
 }
@@ -113,7 +124,8 @@ interface TreeNodeProps {
   depth: number;
   isLast: boolean;
   parentLines: boolean[]; // whether ancestor at each depth has more siblings after
-  onSelect: (id: string) => void;
+  /** Absent while switching is locked */
+  onSelect?: (id: string) => void;
 }
 
 function TreeNodeView({ node, activePathIds, depth, isLast, parentLines, onSelect }: TreeNodeProps) {
@@ -135,9 +147,9 @@ function TreeNodeView({ node, activePathIds, depth, isLast, parentLines, onSelec
           display: "flex",
           alignItems: "center",
           height: 24,
-          cursor: "pointer",
+          cursor: onSelect ? "pointer" : "default",
         }}
-        onClick={() => onSelect(rep.entry.id)}
+        onClick={onSelect ? () => onSelect(rep.entry.id) : undefined}
       >
         {/* Indent guide lines */}
         {parentLines.map((hasLine, i) => (
@@ -245,7 +257,7 @@ function TreeNodeView({ node, activePathIds, depth, isLast, parentLines, onSelec
   );
 }
 
-export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, containerRef, open: openProp, onToggle, hasSession, compact }: Props) {
+export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, containerRef, open: openProp, onToggle, hasSession, compact, hideInlineButton, locked = false }: Props) {
   const { t } = useI18n();
   const [openInternal, setOpenInternal] = useState(false);
   const open = openProp !== undefined ? openProp : openInternal;
@@ -274,10 +286,17 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
   const handleSelect = useCallback((id: string) => {
     onLeafChange(id);
   }, [onLeafChange]);
+  const selectBranch = locked ? undefined : handleSelect;
+
+  const lockedNotice = locked && (
+    <div style={{ padding: "2px 0 4px", fontSize: 11, color: "var(--text-dim)", fontStyle: "italic" }}>
+      {t("i18n.branchesLockedWhileRunning")}
+    </div>
+  );
 
   const noBranchReason = !hasSession
     ? t("i18n.noActiveSession")
-    : !hasBranch(tree)
+    : !hasSessionBranches(tree)
       ? t("i18n.noBranches")
       : null;
 
@@ -307,7 +326,7 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
           ref={btnRef}
           onClick={() => onToggle ? onToggle() : setOpenInternal((v) => !v)}
           style={{
-            display: "flex",
+            display: hideInlineButton ? "none" : "flex",
             alignItems: "center",
             gap: 6,
             height: "100%",
@@ -343,6 +362,7 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
           }}>
             {hasContent ? (
               <div style={{ padding: "4px 12px 8px 12px", maxHeight: 260, overflowY: "auto" }}>
+                {lockedNotice}
                 {topLevel.map((child, idx) => (
                   <TreeNodeView
                     key={child.entry.id}
@@ -351,7 +371,7 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
                     depth={0}
                     isLast={idx === topLevel.length - 1}
                     parentLines={[]}
-                    onSelect={handleSelect}
+                    onSelect={selectBranch}
                   />
                 ))}
               </div>
@@ -404,6 +424,7 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
         }}>
           {hasContent ? (
             <div style={{ padding: "4px 12px 8px 12px", maxHeight: 260, overflowY: "auto" }}>
+              {lockedNotice}
               {topLevel.map((child, idx) => (
                 <TreeNodeView
                   key={child.entry.id}
@@ -412,7 +433,7 @@ export function BranchNavigator({ tree, activeLeafId, onLeafChange, inline, cont
                   depth={0}
                   isLast={idx === topLevel.length - 1}
                   parentLines={[]}
-                  onSelect={handleSelect}
+                  onSelect={selectBranch}
                 />
               ))}
             </div>

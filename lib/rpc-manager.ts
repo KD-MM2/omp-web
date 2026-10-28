@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { getSetting } from "@/lib/omp-settings";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import {
@@ -20,6 +21,7 @@ import {
   readRpcSubagentTranscript,
   RpcSubagentRegistry,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -27,12 +29,22 @@ import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
-import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
-import { untrustedProjectSessionOptions } from "./project-trust";
+import { cacheSessionPath, invalidateSessionListCache, readLatestSessionEntryId } from "./session-reader";
+import {
+  appendClearedSessionToolSelection,
+  appendSessionToolSelection,
+  readSessionToolSelection,
+  validateSessionToolSelection,
+} from "./session-tool-selection";
+import { getProjectTrustStatus, untrustedProjectSessionOptions } from "./project-trust";
+import { createProjectCommandBashOperations } from "./project-command-env";
+import { hasActiveSessionLivenessProvider } from "./session-liveness";
+import { isNestedToolExecutionEvent } from "./agent-event-wire";
 import { resolveSessionSystemPrompts } from "./session-system-prompt";
 import { readDefaultModelRole } from "./model-roles";
 import { getOmpRuntime, getSettingsForCwd } from "./omp-runtime";
 import { PRESET_FULL } from "./tool-presets";
+import { readSubagentRun } from "./subagents";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "./omp-types";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./omp-types";
@@ -44,13 +56,17 @@ import type {
   ExtensionWidgetItem,
   SessionInfo,
   SessionMessageEntry,
+  SessionEntry,
   SubagentSnapshot,
 } from "./types";
-import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
+import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+// The fork's @types/node does not export `Timeout` from node:timers yet.
+type Timeout = ReturnType<typeof setTimeout>;
 
 export interface AgentEvent {
   type: string;
@@ -69,6 +85,43 @@ type CustomUiComponent = {
   handleInput?: (data: string) => void;
   dispose?: () => void;
   invalidate?: () => void;
+};
+
+type ExtensionWidgetComponent = {
+  render: (width: number) => unknown;
+  dispose?: () => void;
+};
+
+type ExtensionWidgetFactory = (tui: HeadlessCustomUiTui, theme: Theme) => unknown;
+
+type ActiveExtensionWidget = {
+  key: string;
+  component: ExtensionWidgetComponent;
+  placement: "aboveEditor" | "belowEditor";
+  generation: number;
+  clearEmitted: boolean;
+  rendered: boolean;
+};
+
+/** The subset of pi's extension command context pi-web projects for `bindExtensions` hosts. */
+type ExtensionCommandContextActionsLike = {
+  waitForIdle: () => Promise<void>;
+  newSession: () => Promise<{ cancelled: boolean }>;
+  fork: () => Promise<{ cancelled: boolean }>;
+  navigateTree: (targetId: string, options?: { summarize?: boolean }) => Promise<{ cancelled: boolean }>;
+  switchSession: () => Promise<{ cancelled: boolean }>;
+  reload: () => Promise<void>;
+};
+
+/** Host settings surface omp-web reads; SDK builds and test doubles vary, so every member is optional. */
+type HostSettingsLike = {
+  setProjectTrusted?: (trusted: boolean) => void;
+  getShellPath?: () => string | undefined;
+};
+
+/** Session manager variants: doubles and non-omp hosts may persist no entries. */
+type HostSessionManagerLike = {
+  getEntries?: () => Array<{ type?: string; mode?: string; data?: Record<string, unknown> }>;
 };
 
 type ActiveCustomUi = {
@@ -178,6 +231,53 @@ class PlainTextTheme extends Theme {
 const PLAIN_TEXT_THEME = new PlainTextTheme();
 const CUSTOM_UI_KEYBINDINGS = new TuiKeybindingsManager(TUI_KEYBINDINGS);
 
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Resolves the PI_WEB_IDLE_TIMEOUT_MS environment variable into a session idle
+ * timeout in milliseconds. An unset/blank value returns the 10-minute default,
+ * `0` disables idle shutdown, and positive values up to Node's timer limit
+ * (2147483647 ms) are used as-is. Invalid or out-of-range values fall back to
+ * the default with a console warning.
+ * @param rawValue Value to parse; defaults to the environment variable.
+ */
+export function resolveSessionIdleTimeoutMs(
+  rawValue: string | undefined = process.env.PI_WEB_IDLE_TIMEOUT_MS,
+): number {
+  if (rawValue !== undefined && rawValue.trim() !== "") {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 2_147_483_647) return parsed;
+    console.warn(`[pi-web] invalid PI_WEB_IDLE_TIMEOUT_MS "${rawValue}", falling back to 10 minutes`);
+  }
+  return DEFAULT_SESSION_IDLE_TIMEOUT_MS;
+}
+
+const SESSION_IDLE_TIMEOUT_MS = resolveSessionIdleTimeoutMs();
+
+const DEFAULT_SESSION_SHUTDOWN_DEADLINE_MS = 5_000;
+
+/**
+ * Resolves the PI_WEB_SHUTDOWN_DEADLINE_MS environment variable into the time
+ * extensions get to handle `session_shutdown` before the wrapper disposes the
+ * SDK session anyway. An unset/blank value returns the 5-second default, and
+ * positive values up to Node's timer limit (2147483647 ms) are used as-is.
+ * `0`, invalid and out-of-range values fall back to the default with a console
+ * warning: shutdown always has a deadline.
+ * @param rawValue Value to parse; defaults to the environment variable.
+ */
+export function resolveSessionShutdownDeadlineMs(
+  rawValue: string | undefined = process.env.PI_WEB_SHUTDOWN_DEADLINE_MS,
+): number {
+  if (rawValue !== undefined && rawValue.trim() !== "") {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed <= 2_147_483_647) return parsed;
+    console.warn(`[pi-web] invalid PI_WEB_SHUTDOWN_DEADLINE_MS "${rawValue}", falling back to 5 seconds`);
+  }
+  return DEFAULT_SESSION_SHUTDOWN_DEADLINE_MS;
+}
+
+const SESSION_SHUTDOWN_DEADLINE_MS = resolveSessionShutdownDeadlineMs();
+
 function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
   if (toolNames.length === 0) return [];
 
@@ -279,6 +379,21 @@ export async function getAvailableSlashCommands(session: AgentSessionLike): Prom
 // Wraps AgentSession with the same interface the rest of the app expects
 // ============================================================================
 
+type WrapperEventBus = { on: (...args: never[]) => unknown };
+
+type AgentSessionWrapperOptions = {
+  /** Observability bus for the fork SDK's subagent registry (see the constructor). */
+  eventBus?: WrapperEventBus;
+  /** Reports the exact per-run system prompt in place of the transcript-replayed one. */
+  exactSystemPrompt?: () => string;
+  /** Chat-only sessions declare no tools and no completion announcements. */
+  chatOnly?: boolean;
+  /** Notified once an accepted agent run reaches idle. */
+  onAgentRunComplete?: (sessionId: string, sessionName: string | undefined) => void;
+  /** Session never announces completion (its work is not operator-facing). */
+  suppressCompletionNotifications?: boolean;
+};
+
 export class AgentSessionWrapper {
   readonly runtimeId = `runtime:${randomUUID()}`;
   private listeners: EventListener[] = [];
@@ -287,18 +402,64 @@ export class AgentSessionWrapper {
   private activeCustomUis = new Map<string, ActiveCustomUi>();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
+  private activeExtensionWidgets = new Map<string, ActiveExtensionWidget>();
+  private extensionWidgetGenerations = new Map<string, number>();
+  private extensionWidgetsResetting = false;
   private promptRunning = false;
+  // Prompts admitted but not yet settled; a accepted prompt counts even after
+  // its run reports, so Stop/teardown still treat the session as busy.
+  private pendingPromptCount = 0;
+  // The tail of the prompt-admission queue: each prompt waits for the
+  // preceding one's preflight to pass or fail before entering the SDK.
+  private promptAdmissionTail: Promise<void> = Promise.resolve();
+  // An accepted run awaits its agent_settled before completion is announced.
+  private agentRunNeedsCompletion = false;
+  // The last settled run was stopped, not finished: nothing to announce.
+  private lastRunAborted = false;
+  // The most recently admitted prompt's text and admission time. The web client
+  // has several accidental double-submit windows (composer remount during the
+  // new-session transition, a second tab, a re-tap while ambiguous-send recovery
+  // still holds the text). A second copy of the same user message lands adjacent
+  // to the first in session history and rewrites the provider request at that
+  // position, invalidating the KV cache prefix for everything after it.
+  private lastAcceptedPrompt: { text: string; at: number } | null = null;
+  // How long after a clean settle an identical resubmission still counts as the
+  // same accidental send. After a stop or rejection the same text is a deliberate
+  // retry and must pass.
+  private promptDedupWindowMs = 12_000;
   // Set while the handoff RPC is in flight so state polls and the running-set
   // stay honest during the long oneshot generation + session transition.
   private handoffRunning = false;
+  // The latest start/update of each running tool call, replayed to new
+  // listeners; cleared when the run ends.
+  private activeToolEvents = new Map<string, AgentEvent>();
+  // Stop could not unwind the run: the idle timer must still reap it.
+  private forceShutdownOnIdle = false;
+  // The armed idle timer is the forced cleanup Stop scheduled.
+  private forcedIdleTimerArmed = false;
+  // Aborted by Stop; every extension UI request made through the current
+  // controller unwinds with it, and a fresh controller starts the next prompt.
+  private extensionUiAbortController = new AbortController();
+  private readonly exactSystemPrompt?: () => string;
+  private readonly chatOnly: boolean = false;
+  private readonly onAgentRunComplete?: (sessionId: string, sessionName: string | undefined) => void;
+  private readonly suppressCompletionNotifications: boolean = false;
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
   private forceEmptySystemPrompt = false;
   private unsubscribe: (() => void) | null = null;
-  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleTimer: Timeout | undefined;
   private onDestroyCallback: (() => void) | null = null;
   private shutdownPromise: Promise<void> | null = null;
+  // True once session_shutdown has been given to the extensions, so destroy()
+  // never hands them a second copy after shutdown() already did.
+  private sessionShutdownEmitted = false;
+  private resolveDisposed: () => void = () => {};
+  private readonly disposed = new Promise<void>((resolve) => { this.resolveDisposed = resolve; });
+  // Set when shutdown() starts. The SDK session stays usable until destroy(),
+  // but lookups must treat the wrapper as gone from this point on.
+  private closing = false;
   private readonly subagents: RpcSubagentRegistry;
   // The SDK registry removes terminal entries after emitting their lifecycle frame.
   // Keep a bounded per-session copy so state requests can still expose history.
@@ -308,9 +469,23 @@ export class AgentSessionWrapper {
 
   constructor(
     public readonly inner: AgentSessionLike,
-    eventBus: ConstructorParameters<typeof RpcSubagentRegistry>[0],
+    // The second argument is either the observability bus (the fork SDK's
+    // RpcSubagentRegistry subscribes to it at construction time and, unlike
+    // upstream, does not tolerate an absent bus; production always gets the
+    // session's real bus from createAgentSession()) or an options object that
+    // carries that bus under `eventBus` plus the wrapper's behavioral options.
+    // Callers/tests that hand over neither get an isolated bus (no producers
+    // -> inert).
+    options: AgentSessionWrapperOptions | WrapperEventBus = {},
   ) {
-    this.subagents = new RpcSubagentRegistry(eventBus, (frame) => {
+    const isBus = typeof (options as WrapperEventBus).on === "function";
+    const asOptions = isBus ? {} as AgentSessionWrapperOptions : (options as AgentSessionWrapperOptions);
+    const eventBus: WrapperEventBus = (isBus ? (options as WrapperEventBus) : asOptions.eventBus) ?? new EventBus();
+    this.exactSystemPrompt = asOptions.exactSystemPrompt;
+    this.chatOnly = asOptions.chatOnly ?? false;
+    this.onAgentRunComplete = asOptions.onAgentRunComplete;
+    this.suppressCompletionNotifications = asOptions.suppressCompletionNotifications ?? false;
+    this.subagents = new RpcSubagentRegistry(eventBus as EventBus, (frame) => {
       const event = frame as unknown as AgentEvent;
       this.rememberSubagentFrame(event);
       this.emit(event);
@@ -413,13 +588,34 @@ export class AgentSessionWrapper {
     return this.inner.sessionManager.getCwd();
   }
 
+  /**
+   * False from the moment shutdown() or destroy() begins, not only once the SDK
+   * session is disposed: extensions may take up to the shutdown deadline to
+   * handle session_shutdown, and a prompt routed here meanwhile would be lost.
+   */
   isAlive(): boolean {
-    return this._alive;
+    return this._alive && !this.closing;
+  }
+
+  /**
+   * Drop this idle wrapper when the on-disk JSONL has an entry the in-memory
+   * index never saw (another pi process appended). Rechecks isRunning() so a
+   * prompt that started during the probe cannot be disposed.
+   */
+  evictIfDiskAhead(): boolean {
+    if (!this.isAlive() || this.isRunning()) return false;
+    const diskLatestId = readLatestSessionEntryId(this.sessionFile);
+    if (!diskLatestId || this.inner.sessionManager.getEntry(diskLatestId)) return false;
+    if (this.isRunning()) return false;
+    this.destroy();
+    invalidateSessionListCache();
+    return true;
   }
 
   isRunning(): boolean {
     return this._alive && (
       this.promptRunning
+      || this.pendingPromptCount > 0
       || this.handoffRunning
       || this.inner.isStreaming
       || this.inner.isCompacting
@@ -444,11 +640,20 @@ export class AgentSessionWrapper {
       // SDK event members are closed interfaces; the browser stream treats them
       // as open records (omp 18.10's cache_warming_* events made that explicit).
       const event = sessionEvent as unknown as AgentEvent;
+      if (event.type === "agent_start") {
+        this.agentRunNeedsCompletion = true;
+        this.lastRunAborted = false;
+      }
+      if (event.type === "agent_settled") this.lastRunAborted = event.aborted === true;
       if (event.type === "agent_end") {
         invalidateSessionListCache();
+        // Every tool call of the run has finished; nothing is left to replay.
+        this.activeToolEvents.clear();
       }
+      this.trackActiveToolEvent(event);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
+      if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
       if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
       void this.goalMode.handleSessionEvent(event).catch((error) => {
         console.error(
@@ -487,31 +692,60 @@ export class AgentSessionWrapper {
     this.extensionBindingError = null;
     this.extensionBindingPromise = (async () => {
       if (!this._alive) return;
-      // omp wires extensions the same way for every non-interactive host; reuse
-      // its shared initializer so omp-web sessions expose exactly the action set
-      // `omp --mode rpc` does, then layer our browser-backed UI context on top.
-      await initializeExtensions(this.inner as never, {
-        uiContext: this.createExtensionUiContext() as never,
-        reportSendError: (action, error) => this.emit({
-          type: "extension_error",
-          extensionPath: action,
-          event: "send",
-          error: error.message,
-        }),
-        reportRuntimeError: (error) => this.emit({
-          type: "extension_error",
-          extensionPath: error.extensionPath,
-          event: error.event,
-          error: error.error,
-        }),
-        onShutdown: () => this.emit({
-          type: "extension_ui_request",
-          id: randomUUID(),
-          method: "notify",
-          notifyType: "warning",
-          message: "Extension requested shutdown, but shutdown is not supported in omp-web.",
-        } as ExtensionUiRequest as AgentEvent),
-      });
+      const uiContext = this.createExtensionUiContext();
+      const bindExtensions = this.inner.bindExtensions as ((bindings: {
+        uiContext?: ExtensionUiContextLike;
+        mode?: "rpc";
+        commandContextActions?: ExtensionCommandContextActionsLike;
+        shutdownHandler?: () => void;
+        onError?: (error: { extensionPath: string; event: string; error: string }) => void;
+      }) => Promise<void>) | undefined;
+      const shutdownHandler = () => this.emit({
+        type: "extension_ui_request",
+        id: randomUUID(),
+        method: "notify",
+        notifyType: "warning",
+        message: "Extension requested shutdown, but shutdown is not supported in omp-web.",
+      } as ExtensionUiRequest as AgentEvent);
+      if (typeof bindExtensions === "function") {
+        // SDKs that let the host bind extensions at session_start: hand them the
+        // browser-backed context and command actions as part of the binding.
+        await bindExtensions.call(this.inner, {
+          uiContext,
+          mode: "rpc",
+          commandContextActions: this.createExtensionCommandContextActions(),
+          shutdownHandler,
+          onError: (error) => this.emit({
+            type: "extension_error",
+            extensionPath: error.extensionPath,
+            event: error.event,
+            error: error.error,
+          }),
+        });
+      } else if (typeof this.inner.extensionRunner?.initialize === "function") {
+        // omp wires extensions the same way for every non-interactive host; reuse
+        // its shared initializer so omp-web sessions expose exactly the action set
+        // `omp --mode rpc` does, then layer our browser-backed UI context on top.
+        await initializeExtensions(this.inner as never, {
+          uiContext: uiContext as never,
+          reportSendError: (action, error) => this.emit({
+            type: "extension_error",
+            extensionPath: action,
+            event: "send",
+            error: error.message,
+          }),
+          reportRuntimeError: (error) => this.emit({
+            type: "extension_error",
+            extensionPath: error.extensionPath,
+            event: error.event,
+            error: error.error,
+          }),
+          onShutdown: shutdownHandler,
+        });
+      } else {
+        // Runners already initialized by the SDK: only the UI context is ours to set.
+        this.inner.extensionRunner?.setUIContext?.(uiContext, "rpc");
+      }
       this.extensionsBound = true;
       this.applyForcedEmptySystemPrompt();
       console.log(`[omp-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
@@ -542,6 +776,7 @@ export class AgentSessionWrapper {
       || type === "follow_up"
       || type === "handoff"
       || type === "get_commands"
+      || type === "get_state"
       || type === "execute_slash_command"
       || type === "goal";
   }
@@ -624,11 +859,10 @@ export class AgentSessionWrapper {
   private syncPlanModeFromSession(): void {
     let state = this.inner.getPlanModeState?.();
     if (!state) {
-      const entries = this.inner.sessionManager.getEntries() as Array<{
-        type?: string;
-        mode?: string;
-        data?: Record<string, unknown>;
-      }>;
+      // Test doubles and non-omp hosts may not surface entries at all; the
+      // persisted mode is then simply unknown, as before the first sync.
+      const sessionManager = this.inner.sessionManager as HostSessionManagerLike | undefined;
+      const entries = sessionManager?.getEntries?.() ?? [];
       let persistedMode: (typeof entries)[number] | undefined;
       for (let index = entries.length - 1; index >= 0; index -= 1) {
         if (entries[index]?.type !== "mode_change") continue;
@@ -745,20 +979,96 @@ export class AgentSessionWrapper {
 
   private emit(event: AgentEvent): void {
     this.syncSessionIdentity();
-    for (const l of this.listeners) l(event);
+    // Snapshot: destroy() emits session_shutdown while SSE handlers unsubscribe
+    // from this very loop, and splicing the live array would skip the next one.
+    for (const l of [...this.listeners]) {
+      try {
+        l(event);
+      } catch (error) {
+        console.error(
+          `[omp-web] failed to deliver ${event.type} event:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+
+  /**
+   * Keep the latest start or update of each running tool call for onEvent() to
+   * replay. Calls a tool makes itself (a codemode script's, which carry
+   * `parentToolCallId`) are left out: a reconnecting client would show each as
+   * a top-level tool, and the parent's own update already reports them. A
+   * nested end can still arrive after its parent's, and is ignored like the rest.
+   */
+  private trackActiveToolEvent(event: AgentEvent): void {
+    const toolCallId = event.toolCallId;
+    if (typeof toolCallId !== "string" || isNestedToolExecutionEvent(event)) return;
+    if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
+      this.activeToolEvents.set(toolCallId, event);
+    } else if (event.type === "tool_execution_end") {
+      this.activeToolEvents.delete(toolCallId);
+      const nestedPrefix = `${toolCallId}/`;
+      for (const id of this.activeToolEvents.keys()) {
+        if (id.startsWith(nestedPrefix)) this.activeToolEvents.delete(id);
+      }
+    }
+  }
+
+  private notifyAgentRunCompleteIfIdle(): void {
+    if (!this.agentRunNeedsCompletion || this.isRunning()) return;
+    this.agentRunNeedsCompletion = false;
+    // A stopped run did not finish a task, as pi's own status reporting has it: nothing to announce.
+    if (this.suppressCompletionNotifications || this.lastRunAborted) return;
+    try {
+      this.onAgentRunComplete?.(this.sessionId, this.inner.sessionManager.getSessionName?.());
+    } catch (error) {
+      console.error("[omp-web] completion listener failed:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  /** `prompt_done`, saying `aborted` when the prompt's run was stopped rather than finished. */
+  private promptDoneEvent(): AgentEvent {
+    return { type: "prompt_done", ...(this.lastRunAborted ? { aborted: true } : {}) };
+  }
+
+  private async acquirePromptAdmission(): Promise<() => void> {
+    const previous = this.promptAdmissionTail;
+    const tail = Promise.withResolvers<void>();
+    this.promptAdmissionTail = tail.promise;
+    await previous;
+    return tail.resolve;
   }
 
   private resetIdleTimer(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (!this._alive) {
+      clearTimeout(this.idleTimer);
+      return;
+    }
+    if (!this.isRunning()) this.forceShutdownOnIdle = false;
+    // A stuck user reloads, reopens the session or presses Stop again, and
+    // each of those commands lands here. Moving the forced deadline for them
+    // would keep a run that Stop cannot unwind alive indefinitely.
+    if (this.forceShutdownOnIdle && this.forcedIdleTimerArmed) return;
+    clearTimeout(this.idleTimer);
+    // A resolved timeout of 0 disables idle shutdown, but a run that Stop could
+    // not unwind is still reaped after the default delay; otherwise it stays
+    // running until the server restarts (#656).
+    const timeoutMs = SESSION_IDLE_TIMEOUT_MS
+      || (this.forceShutdownOnIdle ? DEFAULT_SESSION_IDLE_TIMEOUT_MS : 0);
+    this.forcedIdleTimerArmed = timeoutMs !== 0 && this.forceShutdownOnIdle;
+    if (timeoutMs === 0) return;
     this.idleTimer = setTimeout(() => {
-      if (this.isRunning()) {
+      if (!this.forceShutdownOnIdle && (this.isRunning() || hasActiveSessionLivenessProvider({
+        sessionId: this.sessionId,
+        sessionFile: this.sessionFile || undefined,
+      }))) {
         this.resetIdleTimer();
         return;
       }
       void this.shutdown().catch((error) => {
         console.error("[pi-web] failed to shut down idle session:", error instanceof Error ? error.message : error);
       });
-    }, 10 * 60 * 1000);
+    }, timeoutMs);
   }
 
   private persistBashOnlySession(): void {
@@ -784,6 +1094,7 @@ export class AgentSessionWrapper {
   onEvent(listener: EventListener): () => void {
     this.listeners.push(listener);
     for (const event of this.pendingUiRequests.values()) listener(event);
+    for (const event of this.activeToolEvents.values()) listener(event);
     return () => {
       const i = this.listeners.indexOf(listener);
       if (i !== -1) this.listeners.splice(i, 1);
@@ -794,9 +1105,71 @@ export class AgentSessionWrapper {
     this.onDestroyCallback = cb;
   }
 
+  /**
+   * Resolves `true` once the SDK session is disposed, or `false` after `timeoutMs`:
+   * shutdown() waits for extension binding without a deadline.
+   */
+  waitUntilDisposed(timeoutMs: number): Promise<boolean> {
+    let timer: Timeout | undefined;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    });
+    return Promise.race([this.disposed.then(() => true), timedOut]).finally(() => clearTimeout(timer));
+  }
+
+  /** Chat only declares no tools: the empty selection or the chat-only option. */
+  isChatOnly(): boolean {
+    return this.chatOnly || this.forceEmptySystemPrompt;
+  }
+
+  /** Apply a coding tool selection in place, keeping the fork's goal-mode and prompt rules. */
+  async setActiveToolSelection(toolNames: string[]): Promise<void> {
+    this.setForceEmptySystemPrompt(toolNames.length === 0);
+    await this.inner.setActiveToolsByName(
+      this.goalMode.reconcileToolNames(withExtensionTools(this.inner, toolNames)),
+    );
+    this.applyForcedEmptySystemPrompt();
+  }
+
+  private isPromptInFlight(): boolean {
+    return this.pendingPromptCount > 0 || this.promptRunning || this.inner.isStreaming;
+  }
+
+  /**
+   * True when this text is a copy of the last admitted prompt that is still
+   * relevant: the original is in flight, or it settled cleanly within the dedup
+   * window. Retries after a stop are deliberately not duplicates.
+   */
+  private isDuplicatePromptSubmission(text: string): boolean {
+    const last = this.lastAcceptedPrompt;
+    if (!last || last.text !== text) return false;
+    // A stop voids the fingerprint outright (see case "abort"), so a resend
+    // after Stop is never treated as the accidental copy here.
+    if (this.isPromptInFlight()) return true;
+    return Date.now() - last.at <= this.promptDedupWindowMs;
+  }
+
+  /** True when the SDK's steering/follow-up queue already holds this exact text. */
+  private isQueuedText(text: string): boolean {
+    const queueSource = this.inner as unknown as {
+      getQueuedMessages?: () => { steering: Iterable<string>; followUp: Iterable<string> };
+      getSteeringMessages?: () => Iterable<string>;
+      getFollowUpMessages?: () => Iterable<string>;
+    };
+    const queued = queueSource.getQueuedMessages?.() ?? {
+      steering: queueSource.getSteeringMessages?.() ?? [],
+      followUp: queueSource.getFollowUpMessages?.() ?? [],
+    };
+    for (const queuedText of queued.steering) if (queuedText === text) return true;
+    for (const queuedText of queued.followUp) if (queuedText === text) return true;
+    return false;
+  }
+
   async send(command: Record<string, unknown>): Promise<unknown> {
-    this.resetIdleTimer();
     const type = command.type as string;
+    // Status reconciliation must not postpone forced cleanup after Stop.
+    if (type !== "get_state") this.resetIdleTimer();
     if (this.shouldWaitForExtensions(type)) await this.waitForExtensionsBound();
     if (this.handoffRunning && HANDOFF_ALLOWED_COMMAND_TYPES[type] !== true) {
       throw new Error("Cannot modify the session while a handoff is in progress");
@@ -810,56 +1183,196 @@ export class AgentSessionWrapper {
       if (imageError) throw new Error(imageError);
     }
 
+    // A session whose folder was deleted outside pi-web stays readable, but a
+    // run there would reach the model only for its tools to fail (and `write`
+    // to recreate the folder). The omp CLI does not resume such a session
+    // either; refuse as /api/agent/new does. (A `!` command already refuses.)
+    if (type === "prompt" && !existsSync(this.cwd)) {
+      throw new Error(`Directory does not exist: ${this.cwd}`);
+    }
+
     switch (type) {
       case "prompt": {
-        if (this.inner.isBashRunning) {
-          throw new Error("Cannot send a prompt while a shell command is running");
-        }
-        // A turn the operator asked for means the next continuation is wanted,
-        // and supersedes one already scheduled.
-        this.goalMode.onUserPrompt();
-        // Fire and forget — events come via subscribe
-        const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
-        this.promptRunning = true;
-        notifyRunningChange();
-        this.inner.prompt(command.message as string, {
-          ...(promptImages?.length ? { images: promptImages } : {}),
-          ...(streamingBehavior ? { streamingBehavior } : {}),
-          userInitiated: true,
-        }).then(() => {
-          this.promptRunning = false;
-          this.resetIdleTimer();
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
+        // Serialize only admission. Once the preceding prompt has either
+        // passed or failed preflight, the SDK can atomically decide whether
+        // this submission starts a run or joins its streaming queue.
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          if (this.inner.isBashRunning) {
+            throw new Error("Cannot send a prompt while a shell command is running");
+          }
+          if (this.extensionUiAbortController.signal.aborted) {
+            this.extensionUiAbortController = new AbortController();
+          }
+          const message = command.message as string;
+          const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
+          // Double-submit guard: the same text arriving while its first copy is
+          // in flight or queued — or within the dedup window after a clean
+          // settle — is the accidental second send, not a new instruction.
+          // Accept it silently instead of appending a second copy to history.
+          if (this.isDuplicatePromptSubmission(message) || this.isQueuedText(message)) {
+            return { deduplicated: true };
+          }
+          // A turn the operator asked for means the next continuation is wanted,
+          // and supersedes one already scheduled.
+          this.goalMode.onUserPrompt();
+          const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
+          let preflightAccepted = false;
+          let preflightSettled = false;
+          let promptSettled = false;
+          const preflight = Promise.withResolvers<void>();
+          // A prompt rejected after the response has returned must not surface as an unhandled rejection.
+          preflight.promise.catch(() => {});
+          const acceptPreflight = () => {
+            preflightAccepted = true;
+            this.agentRunNeedsCompletion = true;
+            if (preflightSettled) return;
+            preflightSettled = true;
+            // A new prompt, not one queued into a run: what an earlier run's Stop said is over.
+            if (!streamingBehavior) this.lastRunAborted = false;
+            preflight.resolve();
+          };
+          const rejectPreflight = (error: unknown) => {
+            if (preflightSettled) return;
+            preflightSettled = true;
+            preflight.reject(error);
+          };
+          const finishPrompt = () => {
+            if (promptSettled) return;
+            promptSettled = true;
+            this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
+            this.resetIdleTimer();
+            this.notifyAgentRunCompleteIfIdle();
+            notifyRunningChange();
+          };
+
+          this.pendingPromptCount += 1;
           notifyRunningChange();
-        }).catch((error) => {
-          this.promptRunning = false;
-          this.resetIdleTimer();
-          invalidateSessionListCache();
-          this.emit({
-            type: "prompt_error",
-            errorMessage: error instanceof Error ? error.message : String(error),
+          let prompt: Promise<unknown>;
+          try {
+            this.lastAcceptedPrompt = { text: message, at: Date.now() };
+            prompt = this.inner.prompt(message, {
+              ...(promptImages?.length ? { images: promptImages } : {}),
+              ...(streamingBehavior ? { streamingBehavior } : {}),
+              userInitiated: true,
+              source: "rpc",
+              // Match pi's RPC contract: acknowledge only after synchronous prompt
+              // validation and extension preflight have accepted the submission.
+              // Every disposition (handled, queued, started) is an acceptance; a
+              // rejected prompt never calls these and rejects `prompt` instead.
+              // The omp SDK names the same acceptance point `onPromptAdmitted`.
+              preflightResult: () => acceptPreflight(),
+              onPromptAdmitted: () => acceptPreflight(),
+            });
+          } catch (error) {
+            if (this.lastAcceptedPrompt?.text === message) this.lastAcceptedPrompt = null;
+            finishPrompt();
+            throw error;
+          }
+
+          void prompt.then(() => {
+            // Compatibility fallback if a future SDK resolves without invoking
+            // the internal callback. This waits for the run, but never acks early.
+            acceptPreflight();
+            finishPrompt();
+            if (!streamingBehavior) this.emit(this.promptDoneEvent());
+          }, async (error) => {
+            if (!preflightAccepted) {
+              // Some SDK builds dispatch extension commands inside prompt()
+              // itself. When the SDK failed before ever admitting the
+              // submission, run the command here so the browser sees the
+              // command's UI, as pi's own dispatch would show it, instead of
+              // an internal error.
+              if (await this.tryExecuteExtensionCommand(message)) {
+                acceptPreflight();
+                finishPrompt();
+                if (!streamingBehavior) this.emit(this.promptDoneEvent());
+                return;
+              }
+            }
+            if (this.lastAcceptedPrompt?.text === message) this.lastAcceptedPrompt = null;
+            rejectPreflight(error);
+            finishPrompt();
+            invalidateSessionListCache();
+            // A preflight rejection is returned by the POST itself. Only an
+            // unexpected failure after acceptance needs the asynchronous event.
+            if (preflightAccepted) {
+              this.emit({
+                type: "prompt_error",
+                errorMessage: error instanceof Error ? error.message : String(error),
+              });
+              if (!streamingBehavior) this.emit(this.promptDoneEvent());
+            }
+          }).catch((error) => {
+            console.error(
+              "[omp-web] prompt completion handler failed:",
+              error instanceof Error ? error.message : error,
+            );
           });
-          if (!streamingBehavior) this.emit({ type: "prompt_done" });
-          notifyRunningChange();
-        });
-        return null;
+
+          await preflight.promise;
+          return null;
+        } finally {
+          releaseAdmission();
+        }
       }
 
       case "abort":
+        this.forceShutdownOnIdle = true;
+        // Arm the forced cleanup now: the reset above ran before this flag,
+        // and the final reset only runs once the SDK run has unwound.
+        this.resetIdleTimer();
+        // Stop must unwind extension commands that have not started the agent yet.
+        this.extensionUiAbortController.abort(new DOMException("Extension UI cancelled by Stop", "AbortError"));
         this.goalMode.onAbort();
-        await this.withFinalRunningNotification(() => this.inner.abort());
-        return null;
+        // Stop voids the prompt dedup fingerprint: a resend while the stopped
+        // run unwinds is deliberate. (`lastRunAborted` cannot carry that: the
+        // compat `acceptPreflight` fallback resets it to false on resolve.)
+        this.lastAcceptedPrompt = null;
+        try {
+          await this.withFinalRunningNotification(async () => {
+            try {
+              await this.inner.abort();
+            } catch (error) {
+              // The SDK's own unwind may fail while the wrapper-side Stop of
+              // extension work already succeeded; report, but do not strand Stop.
+              console.error("[omp-web] SDK abort failed:", error instanceof Error ? error.message : error);
+            }
+          });
+          return null;
+        } finally {
+          if (!this.isRunning()) this.forceShutdownOnIdle = false;
+        }
 
       case "get_state": {
         const model = this.inner.model;
         const contextUsage = this.inner.getContextUsage();
+        // Doubles and non-omp hosts expose the queue under its pi names; the omp
+        // accessor wins whenever the SDK provides it.
+        const queueSource = this.inner as AgentSessionLike & {
+          getQueuedMessages?: () => { steering: Iterable<string>; followUp: Iterable<string> };
+          getSteeringMessages?: () => Iterable<string>;
+          getFollowUpMessages?: () => Iterable<string>;
+          pendingMessageCount?: number;
+        };
+        const queued = queueSource.getQueuedMessages?.() ?? {
+          steering: queueSource.getSteeringMessages?.() ?? [],
+          followUp: queueSource.getFollowUpMessages?.() ?? [],
+        };
+        // An exact prompt is projected onto each run by the inline extension. Every other
+        // session reports `agent.state.systemPrompt`, which replays the transcript: that is
+        // what the model actually saw, including sections a `before_agent_start` handler
+        // changed for the run. It stays empty until the first run persists a system message,
+        // so a session that has not sent anything yet falls back to the session getter, which
+        // renders the prompt from the current options. The getter alone would drop those
+        // per-run changes again once the run ends.
+        const stateSystemPrompt = [this.inner.agent.state?.systemPrompt ?? ""].flat().join("\n");
         return {
           sessionId: this.inner.sessionId,
           runtimeId: this.runtimeId,
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
-          isPromptRunning: this.promptRunning,
+          isPromptRunning: this.pendingPromptCount > 0 || this.promptRunning,
           isBashRunning: this.inner.isBashRunning,
           isCompacting: this.inner.isCompacting,
           isHandoffRunning: this.handoffRunning,
@@ -867,17 +1380,17 @@ export class AgentSessionWrapper {
           autoRetryEnabled: this.inner.autoRetryEnabled,
           model: model ? { id: model.id, provider: model.provider } : undefined,
           messageCount: 0,
-          pendingMessageCount: this.inner.queuedMessageCount,
+          pendingMessageCount: queueSource.queuedMessageCount ?? queueSource.pendingMessageCount ?? 0,
           queuedMessages: {
-            steering: [...this.inner.getQueuedMessages().steering],
-            followUp: [...this.inner.getQueuedMessages().followUp],
+            steering: [...queued.steering],
+            followUp: [...queued.followUp],
           },
           contextUsage: contextUsage
             ? { percent: contextUsage.percent, contextWindow: contextUsage.contextWindow, tokens: contextUsage.tokens }
             : null,
-          systemPrompt: [this.inner.agent.state?.systemPrompt ?? ""].flat().join("\n"),
+          systemPrompt: this.exactSystemPrompt?.() || stateSystemPrompt || this.inner.systemPrompt || "",
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
-          configuredThinkingLevel: this.inner.configuredThinkingLevel() ?? "off",
+          configuredThinkingLevel: queueSource.configuredThinkingLevel?.() ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
           subagents: this.getSubagentSnapshots(),
@@ -900,18 +1413,35 @@ export class AgentSessionWrapper {
 
       case "set_model": {
         const { provider, modelId, role } = command as { provider: string; modelId: string; role?: string };
+        // As pi's /model, which refreshes before listing: re-read the saved
+        // definitions even for a known id, so reselecting a model applies a
+        // saved edit of it (#1273). A failed offline refresh keeps the cache.
+        await this.inner.modelRegistry.refresh("offline").catch(() => undefined);
         // modelRegistry.find() takes (provider, modelId) as two arguments — passing a
         // pre-joined "provider/modelId" selector leaves modelId undefined and throws
         // inside the SDK before we ever get a chance to report "model not found".
-        let model = this.inner.modelRegistry.find(provider, modelId);
-        if (!model) {
-          await this.inner.modelRegistry.refresh("offline");
-          model = this.inner.modelRegistry.find(provider, modelId);
-        }
+        const model = this.inner.modelRegistry.find(provider, modelId);
         if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
+        // Reselecting an unchanged model writes nothing.
+        if (isDeepStrictEqual(this.inner.model, model)) {
+          return { id: model.id, provider: model.provider, ...(role ? { role } : {}) };
+        }
+        const sameId = this.inner.model?.provider === provider && this.inner.model?.id === model.id;
+        // The agent state selector is a ConfiguredThinkingLevel at runtime; the
+        // loosely typed agent state loses that, so cast once at read.
+        const thinkingLevel = this.inner.agent?.state?.thinkingLevel as ConfiguredThinkingLevel | undefined;
         // omp records the role a model change came from, so the transcript and
         // the `/model` carousel agree on which role is currently driving.
         await this.inner.setModel(model, role);
+        // A reselect to apply an edit is not a new model choice: keep the level,
+        // clamped to off when the saved edit dropped thinking support (omp only
+        // preserves an explicit off for models without a reasoning budget).
+        // registry.find() hands back a ModelLike; the concrete Model carries the
+        // reasoning flag, so narrow for it instead of asserting the shape.
+        const reasoningCapable =
+          typeof model === "object" && model !== null && "reasoning" in model && model.reasoning === true;
+        const keptLevel: ConfiguredThinkingLevel | undefined = reasoningCapable ? thinkingLevel : "off";
+        if (sameId && keptLevel) this.inner.setThinkingLevel(keptLevel);
         invalidateModelsCache();
         invalidateSessionListCache();
         return { id: model.id, provider: model.provider, ...(role ? { role } : {}) };
@@ -1062,14 +1592,22 @@ export class AgentSessionWrapper {
       }
 
       case "steer": {
+        const steerText = command.message as string;
+        if (this.isDuplicatePromptSubmission(steerText) || this.isQueuedText(steerText)) {
+          return { deduplicated: true };
+        }
         const steerImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.steer(command.message as string, steerImages?.length ? steerImages : undefined);
+        await this.inner.steer(steerText, steerImages?.length ? steerImages : undefined);
         return null;
       }
 
       case "follow_up": {
+        const followText = command.message as string;
+        if (this.isDuplicatePromptSubmission(followText) || this.isQueuedText(followText)) {
+          return { deduplicated: true };
+        }
         const followImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
-        await this.inner.followUp(command.message as string, followImages?.length ? followImages : undefined);
+        await this.inner.followUp(followText, followImages?.length ? followImages : undefined);
         return null;
       }
 
@@ -1104,7 +1642,7 @@ export class AgentSessionWrapper {
           reloadPlugins: async () => {
             await this.waitForExtensionsBound();
             this.extensionStatuses.clear();
-            this.extensionWidgets.clear();
+            this.resetExtensionWidgetsForReload();
             await this.inner.reload();
             await this.inner.refreshSkills?.();
             this.applyForcedEmptySystemPrompt();
@@ -1131,9 +1669,20 @@ export class AgentSessionWrapper {
       }
 
       case "reload": {
+        // A reload invalidates the extension ctx the running turn still holds,
+        // and the turn dies at its next extension hook (#1172). pi refuses too.
+        if (this.isSessionRunningForReplacement()) {
+          throw new Error("Wait for the current response to finish before reloading.");
+        }
+        if (this.extensionUiAbortController.signal.aborted) {
+          this.extensionUiAbortController = new AbortController();
+        }
         await this.waitForExtensionsBound();
         this.extensionStatuses.clear();
-        this.extensionWidgets.clear();
+        // Reset widget state before reload so old widgets are disposed and stale
+        // extension callbacks cannot mutate a widget that no longer exists.
+        this.resetExtensionWidgetsForReload();
+        this.syncProjectTrust();
         await this.inner.reload();
         await this.inner.refreshSkills?.();
         this.applyForcedEmptySystemPrompt();
@@ -1162,13 +1711,29 @@ export class AgentSessionWrapper {
       }
 
       case "bash": {
-        if (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
+        if (
+          this.promptRunning
+          || this.pendingPromptCount > 0
+          || this.inner.isStreaming
+          || this.inner.isCompacting
+          || this.inner.isBashRunning
+        ) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
+        // SDK builds and test doubles differ on the settings manager; each read is optional.
+        const settingsManager = this.inner.settingsManager as HostSettingsLike | undefined;
         const execution = this.inner.executeBash(
           command.command as string,
           undefined,
-          { excludeFromContext: command.excludeFromContext as boolean | undefined },
+          {
+            excludeFromContext: command.excludeFromContext as boolean | undefined,
+            // Project trust is a pi-web browser concern; the SDK runs commands
+            // through a host-supplied sandbox, which omp-web implements as a
+            // per-command PATH overlay in front of the agent-bin directory.
+            operations: createProjectCommandBashOperations({
+              shellPath: settingsManager?.getShellPath?.(),
+            }),
+          },
         );
         notifyRunningChange();
         try {
@@ -1183,6 +1748,9 @@ export class AgentSessionWrapper {
       }
 
       case "abort_bash": {
+        // Stop must force cleanup even when the SDK's bash state cannot unwind.
+        this.forceShutdownOnIdle = true;
+        this.resetIdleTimer();
         this.inner.abortBash();
         return null;
       }
@@ -1195,11 +1763,14 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    // Tell attached SSE listeners to drop this instance so the browser
+    // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
+    this.emit({ type: "session_shutdown" });
     const finalIds = globalThis.__ompFinalSessionIds ??= new Map<string, string>();
     finalIds.set(this.runtimeId, this.sessionId);
     // A bounded continuation record, never a historical-session alias.
     while (finalIds.size > 1024) finalIds.delete(finalIds.keys().next().value!);
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    clearTimeout(this.idleTimer);
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
     this.goalModeController?.dispose();
@@ -1209,25 +1780,58 @@ export class AgentSessionWrapper {
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
-    try {
-      void this.inner.dispose?.();
-    } finally {
+    this.activeToolEvents.clear();
+    this.clearExtensionWidgets(false);
+
+    const finishDispose = () => {
       try {
-        // Runtime fallback can move this wrapper away from its startup ID.
-        // Remove only this instance, preserving separately reopened sessions.
-        for (const [id, session] of globalThis.__ompSessions ?? []) {
-          if (session === this) globalThis.__ompSessions?.delete(id);
-        }
-        this.onDestroyCallback?.();
+        void this.inner.dispose?.();
       } finally {
-        notifyRunningChange();
+        try {
+          // Runtime fallback can move this wrapper away from its startup ID.
+          // Remove only this instance, preserving separately reopened sessions.
+          for (const [id, session] of globalThis.__ompSessions ?? []) {
+            if (session === this) globalThis.__ompSessions?.delete(id);
+          }
+          this.onDestroyCallback?.();
+        } finally {
+          notifyRunningChange();
+          this.resolveDisposed();
+        }
       }
+    };
+
+    // Always emit session_shutdown before dispose, even when callers skip
+    // shutdown() (process exit, direct destroy). Await when possible so
+    // extension MCP children can reap before the runner is invalidated.
+    if (this.sessionShutdownEmitted) {
+      finishDispose();
+      return;
     }
+
+    this.sessionShutdownEmitted = true;
+    const emit = this.inner.extensionRunner?.emit;
+    if (typeof emit !== "function") {
+      finishDispose();
+      return;
+    }
+
+    void this.emitSessionShutdown(emit)
+      .catch((error) => {
+        console.error(
+          "[pi-web] session_shutdown before dispose failed:",
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(finishDispose);
   }
 
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     if (!this._alive) return;
+    // Closing starts before the first await, so a request that arrives while
+    // extensions shut down starts a fresh wrapper instead of prompting this one.
+    this.closing = true;
 
     this.shutdownPromise = (async () => {
       try {
@@ -1239,12 +1843,49 @@ export class AgentSessionWrapper {
             error instanceof Error ? error.message : error,
           );
         }
-        await this.inner.extensionRunner?.emit?.({ type: "session_shutdown", reason: "quit" });
+        if (!this.sessionShutdownEmitted) {
+          this.sessionShutdownEmitted = true;
+          const emit = this.inner.extensionRunner?.emit;
+          if (typeof emit === "function") await this.emitSessionShutdown(emit);
+        }
       } finally {
         this.destroy();
       }
     })();
     return this.shutdownPromise;
+  }
+
+  /**
+   * Gives extensions at most SESSION_SHUTDOWN_DEADLINE_MS to handle
+   * session_shutdown, then returns so the SDK session is disposed and
+   * unregistered anyway. Closing an MCP connection has no upper bound: it waits
+   * for a token refresh in flight and for a stdio child whose daemonized
+   * grandchild may never close stdout.
+   */
+  private async emitSessionShutdown(
+    emit: (event: { type: "session_shutdown"; reason: "quit" }) => Promise<unknown>,
+  ): Promise<void> {
+    let timer: Timeout | undefined;
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), SESSION_SHUTDOWN_DEADLINE_MS);
+      // A quitting process must not wait for an extension's cleanup.
+      timer.unref?.();
+    });
+    // A synchronous throw becomes a rejection, and a rejection that arrives
+    // after the deadline is still handled by the race below.
+    const handled = (async () => {
+      await emit.call(this.inner.extensionRunner, { type: "session_shutdown", reason: "quit" });
+      return "handled" as const;
+    })();
+    try {
+      if (await Promise.race([handled, deadline]) === "timeout") {
+        console.warn(
+          `[pi-web] extensions did not finish session_shutdown for session ${this.sessionId} within ${SESSION_SHUTDOWN_DEADLINE_MS} ms; disposing it anyway`,
+        );
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private resolveExtensionUiResponse(response: ExtensionUiResponse): void {
@@ -1259,6 +1900,289 @@ export class AgentSessionWrapper {
 
   private getExtensionWidgets(): ExtensionWidgetItem[] {
     return Array.from(this.extensionWidgets.values());
+  }
+
+  private isSessionRunningForReplacement(): boolean {
+    return this.inner.isBashRunning
+      || this.inner.isStreaming
+      || this.inner.isCompacting
+      || this.pendingPromptCount > 0;
+  }
+
+  private syncProjectTrust(): void {
+    const status = getProjectTrustStatus(this.cwd, getAgentDir());
+    // SDK builds and test doubles differ on the settings manager; each read is optional.
+    const settingsManager = this.inner.settingsManager as HostSettingsLike | undefined;
+    settingsManager?.setProjectTrusted?.(status.trusted);
+  }
+
+  /**
+   * Dispatches an extension command the way the SDK's own prompt path does, for
+   * builds where the wrapper must run it itself: the handler receives a command
+   * context, and a failing handler is reported through the runner's error channel
+   * exactly as pi reports a command that died inside a prompt. Resolves whether
+   * a command was found and run.
+   */
+  private async tryExecuteExtensionCommand(message: string): Promise<boolean> {
+    if (typeof message !== "string" || !message.startsWith("/")) return false;
+    const name = message.slice(1).split(/\s+/)[0];
+    if (!name) return false;
+    // Some SDK builds keep the runner on a private field rather than the public accessor.
+    const inner = this.inner as { _extensionRunner?: AgentSessionLike["extensionRunner"] };
+    const runner = inner._extensionRunner ?? this.inner.extensionRunner;
+    const command = runner?.getCommand?.(name);
+    if (!command) return false;
+    try {
+      await command.handler(runner?.createCommandContext?.() ?? {});
+    } catch (error) {
+      runner?.emitError?.({
+        extensionPath: "extension-command",
+        event: "command",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return true;
+  }
+
+  private createExtensionCommandContextActions(): ExtensionCommandContextActionsLike {
+    return {
+      waitForIdle: async () => {
+        const agent = this.inner.agent as { waitForIdle?: () => Promise<void> };
+        await agent.waitForIdle?.();
+      },
+      newSession: async () => ({ cancelled: true }),
+      fork: async () => ({ cancelled: true }),
+      navigateTree: (targetId, options) => this.send({
+        type: "navigate_tree",
+        targetId,
+        ...(options?.summarize !== undefined ? { summarize: options.summarize } : {}),
+      }) as Promise<{ cancelled: boolean }>,
+      switchSession: async () => ({ cancelled: true }),
+      reload: async () => {
+        // As pi's TUI: a command runs inside its own prompt, so the pending
+        // prompt does not count; only a streaming or compacting turn does.
+        const busy = this.inner.isStreaming
+          ? "Wait for the current response to finish before reloading."
+          : this.inner.isCompacting
+            ? "Wait for compaction to finish before reloading."
+            : null;
+        if (busy) {
+          this.emit({
+            type: "extension_ui_request",
+            id: randomUUID(),
+            method: "notify",
+            notifyType: "warning",
+            message: busy,
+          } as ExtensionUiRequest as AgentEvent);
+          return;
+        }
+        this.extensionStatuses.clear();
+        this.resetExtensionWidgetsForReload();
+        this.syncProjectTrust();
+        await this.inner.reload({
+          beforeSessionStart: () => {
+            this.inner.extensionRunner?.setUIContext?.(this.createExtensionUiContext(), "rpc");
+          },
+        });
+        // As the `reload` command: the provider lists' runtime follows.
+        invalidateModelsCache();
+      },
+    };
+  }
+
+  private nextExtensionWidgetGeneration(key: string): number {
+    const generation = (this.extensionWidgetGenerations.get(key) ?? 0) + 1;
+    this.extensionWidgetGenerations.set(key, generation);
+    return generation;
+  }
+
+  private disposeExtensionWidgetComponent(component: unknown): void {
+    if (!component || (typeof component !== "object" && typeof component !== "function")) return;
+    const dispose = (component as { dispose?: unknown }).dispose;
+    if (typeof dispose !== "function") return;
+    try {
+      dispose.call(component);
+    } catch {
+      // Ignore dispose errors from extension widgets.
+    }
+  }
+
+  private emitExtensionWidgetClear(key: string): void {
+    this.emit({
+      type: "extension_ui_request",
+      id: randomUUID(),
+      method: "setWidget",
+      widgetKey: key,
+      widgetLines: undefined,
+      widgetPlacement: undefined,
+    } as ExtensionUiRequest as AgentEvent);
+  }
+
+  private clearExtensionWidget(key: string, emitClear = true): number {
+    const generation = this.nextExtensionWidgetGeneration(key);
+
+    const active = this.activeExtensionWidgets.get(key);
+    this.activeExtensionWidgets.delete(key);
+    this.extensionWidgets.delete(key);
+    if (active) this.disposeExtensionWidgetComponent(active.component);
+    if (this.extensionWidgetGenerations.get(key) !== generation) return generation;
+    if (emitClear) this.emitExtensionWidgetClear(key);
+    return generation;
+  }
+
+  private clearExtensionWidgets(emitClear: boolean): void {
+    const keys = new Set([
+      ...this.extensionWidgets.keys(),
+      ...this.activeExtensionWidgets.keys(),
+    ]);
+    for (const key of keys) this.clearExtensionWidget(key, emitClear);
+  }
+
+  private resetExtensionWidgetsForReload(): void {
+    this.extensionWidgetsResetting = true;
+    try {
+      const factoryKeys = [...this.activeExtensionWidgets.keys()];
+      for (const key of factoryKeys) this.clearExtensionWidget(key);
+      // Keep the existing array-widget reload behavior: snapshots are reset and
+      // the next extension session_start repopulates them.
+      this.extensionWidgets.clear();
+    } finally {
+      this.extensionWidgetsResetting = false;
+    }
+  }
+
+  private emitExtensionWidgetError(key: string, error: unknown): void {
+    this.emit({
+      type: "extension_error",
+      extensionPath: `extension-widget:${key}`,
+      event: "setWidget",
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  private failExtensionWidget(
+    key: string,
+    generation: number,
+    error: unknown,
+    clearEmitted: boolean,
+    component?: unknown,
+  ): void {
+    if (this.extensionWidgetGenerations.get(key) !== generation) {
+      this.disposeExtensionWidgetComponent(component);
+      return;
+    }
+
+    const active = this.activeExtensionWidgets.get(key);
+    let shouldEmitClear = !clearEmitted;
+    if (active?.generation === generation) {
+      shouldEmitClear = active.rendered || !active.clearEmitted;
+      this.activeExtensionWidgets.delete(key);
+      this.disposeExtensionWidgetComponent(active.component);
+    } else {
+      this.disposeExtensionWidgetComponent(component);
+    }
+    if (this.extensionWidgetGenerations.get(key) !== generation) {
+      this.emitExtensionWidgetError(key, error);
+      return;
+    }
+    this.extensionWidgets.delete(key);
+    if (shouldEmitClear) this.emitExtensionWidgetClear(key);
+    this.emitExtensionWidgetError(key, error);
+  }
+
+  private renderExtensionWidget(active: ActiveExtensionWidget): void {
+    if (
+      this.activeExtensionWidgets.get(active.key) !== active
+      || this.extensionWidgetGenerations.get(active.key) !== active.generation
+    ) return;
+
+    let lines: unknown;
+    try {
+      lines = active.component.render(DEFAULT_CUSTOM_UI_COLUMNS);
+    } catch (error) {
+      this.failExtensionWidget(active.key, active.generation, error, active.clearEmitted);
+      return;
+    }
+    if (!Array.isArray(lines) || !lines.every((line) => typeof line === "string")) {
+      this.failExtensionWidget(
+        active.key,
+        active.generation,
+        new Error("Extension widget render must return string[]"),
+        active.clearEmitted,
+      );
+      return;
+    }
+    if (
+      this.activeExtensionWidgets.get(active.key) !== active
+      || this.extensionWidgetGenerations.get(active.key) !== active.generation
+    ) return;
+
+    const widgetLines = lines as string[];
+    this.extensionWidgets.set(active.key, {
+      key: active.key,
+      lines: widgetLines,
+      placement: active.placement,
+    });
+    active.rendered = true;
+    this.emit({
+      type: "extension_ui_request",
+      id: randomUUID(),
+      method: "setWidget",
+      widgetKey: active.key,
+      widgetLines,
+      widgetPlacement: active.placement,
+    } as ExtensionUiRequest as AgentEvent);
+  }
+
+  private setExtensionWidgetFactory(
+    key: string,
+    factory: ExtensionWidgetFactory,
+    options?: { placement?: "aboveEditor" | "belowEditor" },
+  ): void {
+    const hadPrevious = this.extensionWidgets.has(key) || this.activeExtensionWidgets.has(key);
+    const generation = this.clearExtensionWidget(key, hadPrevious);
+    if (this.extensionWidgetGenerations.get(key) !== generation) return;
+    const tui = createHeadlessCustomUiTui(() => {
+      const active = this.activeExtensionWidgets.get(key);
+      if (active?.generation === generation) this.renderExtensionWidget(active);
+    }, DEFAULT_CUSTOM_UI_COLUMNS);
+
+    let component: unknown;
+    try {
+      component = factory(tui, PLAIN_TEXT_THEME);
+    } catch (error) {
+      this.failExtensionWidget(key, generation, error, hadPrevious);
+      return;
+    }
+    if (this.extensionWidgetGenerations.get(key) !== generation) {
+      this.disposeExtensionWidgetComponent(component);
+      return;
+    }
+    if (
+      !component
+      || (typeof component !== "object" && typeof component !== "function")
+      || typeof (component as { render?: unknown }).render !== "function"
+    ) {
+      this.failExtensionWidget(
+        key,
+        generation,
+        new Error("Extension widget factory must return a component with render(width)"),
+        hadPrevious,
+        component,
+      );
+      return;
+    }
+
+    const active: ActiveExtensionWidget = {
+      key,
+      component: component as ExtensionWidgetComponent,
+      placement: options?.placement ?? "aboveEditor",
+      generation,
+      clearEmitted: hadPrevious,
+      rendered: false,
+    };
+    this.activeExtensionWidgets.set(key, active);
+    this.renderExtensionWidget(active);
   }
 
   private getCustomUiWidth(options: unknown): number {
@@ -1333,66 +2257,73 @@ export class AgentSessionWrapper {
   ): Promise<T> {
     if (typeof factory !== "function") return Promise.resolve(undefined as T);
 
+    const stopSignal = this.extensionUiAbortController.signal;
+    if (stopSignal.aborted) return Promise.reject(stopSignal.reason);
+
     const id = randomUUID();
     const width = this.getCustomUiWidth(options);
+    const { promise, resolve, reject } = Promise.withResolvers<T>();
 
-    return new Promise<T>((resolve) => {
-      let completed = false;
-      const tui = createHeadlessCustomUiTui(
-        () => {
-          const custom = this.activeCustomUis.get(id);
-          if (custom) this.emitCustomUiRender(id, custom);
-        },
-        width,
-      );
-      const finish = (value: T) => {
-        if (completed) return;
-        completed = true;
-        resolve(value);
-      };
-      const done = (value: T) => {
-        if (this.activeCustomUis.has(id)) {
-          this.closeCustomUi(id, value);
-        } else {
-          finish(value);
+    let completed = false;
+    const tui = createHeadlessCustomUiTui(
+      () => {
+        const custom = this.activeCustomUis.get(id);
+        if (custom) this.emitCustomUiRender(id, custom);
+      },
+      width,
+    );
+    const finish = (value: T) => {
+      if (completed) return;
+      completed = true;
+      stopSignal.removeEventListener("abort", onStop);
+      if (stopSignal.aborted) reject(stopSignal.reason);
+      else resolve(value);
+    };
+    const done = (value: T) => {
+      if (this.activeCustomUis.has(id)) {
+        this.closeCustomUi(id, value);
+      } else {
+        finish(value);
+      }
+    };
+    const onStop = () => done(undefined as T);
+    stopSignal.addEventListener("abort", onStop, { once: true });
+
+    void Promise.resolve()
+      .then(() => completed ? undefined : factory(tui, PLAIN_TEXT_THEME, CUSTOM_UI_KEYBINDINGS, done))
+      .then((component) => {
+        if (completed) {
+          try {
+            (component as CustomUiComponent | undefined)?.dispose?.();
+          } catch {
+            // Ignore dispose errors from a component completed before mounting.
+          }
+          return;
         }
-      };
-
-      Promise.resolve()
-        .then(() => factory(tui, PLAIN_TEXT_THEME, CUSTOM_UI_KEYBINDINGS, done))
-        .then((component) => {
-          if (completed) {
-            try {
-              (component as CustomUiComponent | undefined)?.dispose?.();
-            } catch {
-              // Ignore dispose errors from a component completed before mounting.
-            }
-            return;
-          }
-          if (!component || typeof component !== "object" || typeof (component as CustomUiComponent).render !== "function") {
-            finish(undefined as T);
-            return;
-          }
-          const custom: ActiveCustomUi = {
-            component: component as CustomUiComponent,
-            width,
-            resolve: (value) => finish(value as T),
-            settled: false,
-          };
-          this.activeCustomUis.set(id, custom);
-          this.emitCustomUiRender(id, custom);
-        })
-        .catch((error) => {
-          if (completed) return;
-          this.emit({
-            type: "extension_error",
-            extensionPath: `custom-ui:${id}`,
-            event: "custom_ui",
-            error: error instanceof Error ? error.message : String(error),
-          });
+        if (!component || typeof component !== "object" || typeof (component as CustomUiComponent).render !== "function") {
           finish(undefined as T);
+          return;
+        }
+        const custom: ActiveCustomUi = {
+          component: component as CustomUiComponent,
+          width,
+          resolve: (value) => finish(value as T),
+          settled: false,
+        };
+        this.activeCustomUis.set(id, custom);
+        this.emitCustomUiRender(id, custom);
+      })
+      .catch((error) => {
+        if (completed) return;
+        this.emit({
+          type: "extension_error",
+          extensionPath: `custom-ui:${id}`,
+          event: "custom_ui",
+          error: error instanceof Error ? error.message : String(error),
         });
-    });
+        finish(undefined as T);
+      });
+    return promise;
   }
 
   private requestExtensionUi<T>(
@@ -1403,6 +2334,9 @@ export class AgentSessionWrapper {
     signal?: AbortSignal,
   ): Promise<T> {
     if (signal?.aborted) return Promise.resolve(defaultValue);
+    const stopSignal = this.extensionUiAbortController.signal;
+    if (stopSignal.aborted) return Promise.reject(stopSignal.reason);
+    const abortSignal = signal ? AbortSignal.any([signal, stopSignal]) : stopSignal;
 
     const id = randomUUID();
     const fullRequest = {
@@ -1412,30 +2346,35 @@ export class AgentSessionWrapper {
       ...(timeout ? { timeout, expiresAt: Date.now() + timeout } : {}),
     };
 
-    return new Promise((resolve) => {
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      const cleanup = () => {
-        if (timeoutId) clearTimeout(timeoutId);
-        signal?.removeEventListener("abort", onAbort);
-        this.pendingUiRequests.delete(id);
-        this.pendingUiResponses.delete(id);
-      };
-      const settle = (value: T) => {
-        cleanup();
-        resolve(value);
-      };
-      const onAbort = () => settle(defaultValue);
+    const { promise, resolve, reject } = Promise.withResolvers<T>();
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      abortSignal.removeEventListener("abort", onAbort);
+      this.pendingUiRequests.delete(id);
+      this.pendingUiResponses.delete(id);
+      this.emit({ type: "extension_ui_closed", id });
+    };
+    const settle = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (stopSignal.aborted) reject(stopSignal.reason);
+      else resolve(value);
+    };
+    const onAbort = () => settle(defaultValue);
 
-      if (timeout) timeoutId = setTimeout(() => settle(defaultValue), timeout);
-      signal?.addEventListener("abort", onAbort, { once: true });
+    if (timeout) timeoutId = setTimeout(() => settle(defaultValue), timeout);
+    abortSignal.addEventListener("abort", onAbort, { once: true });
 
-      this.pendingUiRequests.set(id, fullRequest as AgentEvent);
-      this.pendingUiResponses.set(id, {
-        resolve: (response) => settle(parseResponse(response)),
-        cancel: () => settle(defaultValue),
-      });
-      this.emit(fullRequest as AgentEvent);
+    this.pendingUiRequests.set(id, fullRequest as AgentEvent);
+    this.pendingUiResponses.set(id, {
+      resolve: (response) => settle(parseResponse(response)),
+      cancel: () => settle(defaultValue),
     });
+    this.emit(fullRequest as AgentEvent);
+    return promise;
   }
 
   private createExtensionUiContext(): ExtensionUiContextLike {
@@ -1509,16 +2448,29 @@ export class AgentSessionWrapper {
       setWorkingIndicator: () => {},
       setHiddenThinkingLabel: () => {},
       setWidget: (key, content, options) => {
+        if (!this._alive || this.extensionWidgetsResetting) return;
+        if (typeof content === "function") {
+          this.setExtensionWidgetFactory(
+            key,
+            content as unknown as ExtensionWidgetFactory,
+            options,
+          );
+          return;
+        }
         if (content !== undefined && !Array.isArray(content)) return;
         if (content === undefined) {
-          this.extensionWidgets.delete(key);
-        } else {
-          this.extensionWidgets.set(key, {
-            key,
-            lines: content,
-            placement: options?.placement ?? "aboveEditor",
-          });
+          this.clearExtensionWidget(key);
+          return;
         }
+        const generation = this.activeExtensionWidgets.has(key)
+          ? this.clearExtensionWidget(key)
+          : this.nextExtensionWidgetGeneration(key);
+        if (this.extensionWidgetGenerations.get(key) !== generation) return;
+        this.extensionWidgets.set(key, {
+          key,
+          lines: content,
+          placement: options?.placement ?? "aboveEditor",
+        });
         this.emit({
           type: "extension_ui_request",
           id: randomUUID(),
@@ -1575,6 +2527,10 @@ export class AgentSessionWrapper {
 
 declare global {
   var __ompSessions: Map<string, AgentSessionWrapper> | undefined;
+  // Legacy pi-web integration names: alias handles for the same maps, kept
+  // pointing at the live runtime-identity registry (never a second registry).
+  var __piSessions: Map<string, AgentSessionWrapper> | undefined;
+  var __piStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompFinalSessionIds: Map<string, string> | undefined;
   var __ompStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompStartingSessionCwds: Map<string, number> | undefined;
@@ -1583,7 +2539,8 @@ declare global {
 
 function getRegistry(): Map<string, AgentSessionWrapper> {
   if (!globalThis.__ompSessions) {
-    globalThis.__ompSessions = new Map();
+    // A previous module generation under the pi-web name may already own the map.
+    globalThis.__ompSessions = globalThis.__piSessions ?? new Map();
     const cleanup = () => globalThis.__ompSessions?.forEach((s) => s.destroy());
     process.once("exit", cleanup);
     process.once("SIGINT", cleanup);
@@ -1600,12 +2557,47 @@ function getRegistry(): Map<string, AgentSessionWrapper> {
     Reflect.set(session, "onDestroyCallback", null);
     Object.setPrototypeOf(session, AgentSessionWrapper.prototype);
   }
+  globalThis.__piSessions = globalThis.__ompSessions;
   return globalThis.__ompSessions;
 }
 
 function getLocks(): Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> {
-  if (!globalThis.__ompStartLocks) globalThis.__ompStartLocks = new Map();
+  if (!globalThis.__ompStartLocks) {
+    globalThis.__ompStartLocks = globalThis.__piStartLocks ?? new Map();
+  }
+  globalThis.__piStartLocks = globalThis.__ompStartLocks;
   return globalThis.__ompStartLocks;
+}
+
+const CLOSING_SESSION_WAIT_MARGIN_MS = 1_000;
+const closingSessionWaits = new WeakMap<AgentSessionWrapper, { done: boolean; promise: Promise<void> }>();
+
+/**
+ * The wait for a wrapper of `sessionId` that is shutting down, or null when there is none
+ * left to wait for. Until it is disposed the closing wrapper still owns the session: an
+ * extension's session_shutdown may append to the file, which a replacement opened earlier
+ * would branch away from, and dispose() releases provider resources (a Codex websocket) by
+ * session id, which the replacement shares. The wait is bounded so a shutdown stuck in
+ * extension binding cannot keep the session from starting again. One wait per closing
+ * wrapper: its bound runs from the first caller and later callers share it, so a
+ * shutdown still binding extensions can be overtaken.
+ */
+function closingRpcSessionWait(sessionId: string): Promise<void> | null {
+  const closing = getRegistry().get(sessionId);
+  // A wrapper from before a hot reload may lack waitUntilDisposed.
+  if (!closing || closing.isAlive() || typeof closing.waitUntilDisposed !== "function") return null;
+  let wait = closingSessionWaits.get(closing);
+  if (!wait) {
+    const entry = { done: false, promise: Promise.resolve() };
+    entry.promise = closing.waitUntilDisposed(SESSION_SHUTDOWN_DEADLINE_MS + CLOSING_SESSION_WAIT_MARGIN_MS)
+      .then((disposed) => {
+        if (!disposed) console.warn(`[pi-web] session ${sessionId} is still shutting down; starting it again anyway`);
+      })
+      .finally(() => { entry.done = true; });
+    closingSessionWaits.set(closing, entry);
+    wait = entry;
+  }
+  return wait.done ? null : wait.promise;
 }
 
 function normalizeRpcCwd(cwd: string): string {
@@ -1645,10 +2637,89 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
     if (candidate.isAlive()) candidate.syncSessionIdentity?.();
   }
   const registered = registry.get(sessionId);
-  if (registered?.isAlive() && registered.sessionId === sessionId) return registered;
+  // The entry registered under the exact id answers even while closing: it still
+  // owns the session file until disposed, and callers gate routed work on isAlive().
+  if (registered && registered.sessionId === sessionId) return registered;
   return [...registry.values()].find(
     (candidate) => candidate.isAlive() && (candidate.sessionId === sessionId || candidate.runtimeId === sessionId),
   );
+}
+
+export interface SetRpcSessionToolsResult {
+  session: AgentSessionWrapper;
+  sessionId: string;
+  recreated: boolean;
+}
+
+/**
+ * Persist a normal session's tool selection and rebuild when resource policy changes.
+ * An undefined requestedToolNames returns the session to pi's configured defaults:
+ * the pin is retracted and the session is rebuilt, because the loadout that
+ * settings.json defaultTools resolves to is only known once pi builds the session.
+ */
+export async function setRpcSessionTools(
+  sessionId: string,
+  sessionFile: string | undefined,
+  requestedToolNames: unknown,
+): Promise<SetRpcSessionToolsResult> {
+  const toolNames = requestedToolNames === undefined
+    ? undefined
+    : validateSessionToolSelection(requestedToolNames);
+  const existing = getRpcSession(sessionId);
+
+  if (!existing?.isAlive()) {
+    if (!sessionFile) throw new Error("Session not found");
+    // A wrapper still closing, or a start already under way, owns the file: wait for it and
+    // apply the selection to whatever it left, or a start that opened the file first would
+    // come up without the selection while this call reported success.
+    const pending = closingRpcSessionWait(sessionId) ?? getLocks().get(sessionId);
+    if (pending) {
+      await pending.catch(() => undefined);
+      return setRpcSessionTools(sessionId, sessionFile, requestedToolNames);
+    }
+    const manager = await SessionManager.open(sessionFile, undefined);
+    if (toolNames === undefined) appendClearedSessionToolSelection(manager);
+    else appendSessionToolSelection(manager, toolNames);
+    invalidateSessionListCache();
+    const started = await startRpcSession(sessionId, sessionFile, undefined);
+    return { session: started.session, sessionId: started.realSessionId, recreated: false };
+  }
+
+  if (existing.isRunning()) throw new Error("Cannot change tools while the session is running");
+
+  const hasCurrentResourcePolicy = typeof existing.isChatOnly === "function"
+    && typeof existing.setActiveToolSelection === "function";
+  const crossesChatOnlyBoundary = toolNames === undefined
+    || !hasCurrentResourcePolicy
+    || existing.isChatOnly() !== (toolNames.length === 0);
+  if (toolNames === undefined) appendClearedSessionToolSelection(existing.inner.sessionManager);
+  else appendSessionToolSelection(existing.inner.sessionManager, toolNames);
+  invalidateSessionListCache();
+
+  if (toolNames !== undefined && !crossesChatOnlyBoundary) {
+    await existing.setActiveToolSelection(toolNames);
+    return { session: existing, sessionId, recreated: false };
+  }
+
+  const persistedFile = existing.sessionFile && existsSync(existing.sessionFile)
+    ? existing.sessionFile
+    : undefined;
+  const sessionCwd = existing.cwd;
+  const model = existing.inner.model;
+  const currentThinkingLevel = existing.inner.agent.state?.thinkingLevel;
+  await existing.shutdown();
+
+  if (persistedFile) {
+    const started = await startRpcSession(sessionId, persistedFile, undefined);
+    return { session: started.session, sessionId: started.realSessionId, recreated: true };
+  }
+
+  const started = await startRpcSession(`__recreate__${randomUUID()}`, "", sessionCwd, {
+    ...(toolNames !== undefined ? { toolNames } : {}),
+    ...(model ? { initialModel: { provider: model.provider, modelId: model.id } } : {}),
+    ...(currentThinkingLevel ? { thinkingLevel: currentThinkingLevel as ConfiguredThinkingLevel } : {}),
+  });
+  return { session: started.session, sessionId: started.realSessionId, recreated: true };
 }
 
 function runtimeMessageText(entry: SessionMessageEntry): string {
@@ -1673,12 +2744,13 @@ function runtimeMessageActivityMs(entry: SessionMessageEntry): number | undefine
  * the first JSONL flush until an assistant message exists, so an accepted new
  * prompt must temporarily be described from its in-memory SessionManager.
  */
-export function getRpcSessionInfos(): SessionInfo[] {
+export function getRpcSessionInfos(options: { includeTransient?: boolean } = {}): SessionInfo[] {
   const sessions: SessionInfo[] = [];
   for (const session of getRegistry().values()) {
-    if (!session.isAlive()) continue;
-
-    const manager = session.inner.sessionManager;
+    if (typeof session.isAlive !== "function" || !session.isAlive()) continue;
+    // Registry entries seeded by tests or other helpers may lack wrapper internals.
+    const manager = session.inner?.sessionManager;
+    if (!manager) continue;
     const header = manager.getHeader();
     const entries = manager.getEntries() as unknown as Array<
       { type: string; timestamp: string } | SessionMessageEntry
@@ -1687,10 +2759,11 @@ export function getRpcSessionInfos(): SessionInfo[] {
     const firstUserMessage = messages.find((entry) => entry.message.role === "user");
     const sessionFile = manager.getSessionFile() ?? session.sessionFile;
     const persisted = Boolean(sessionFile && existsSync(sessionFile));
+    const subagent = readSubagentRun(entries as unknown as SessionEntry[], header?.id ?? session.sessionId, sessionFile ?? "");
 
     // An ensure_session call creates an idle, empty runtime while the composer
     // loads commands. Do not leak it into history before a prompt is accepted.
-    if (!persisted && (!session.isRunning() || !firstUserMessage)) continue;
+    if (!persisted && !options.includeTransient && (!session.isRunning() || !firstUserMessage)) continue;
 
     const created = header?.timestamp
       ?? entries[0]?.timestamp
@@ -1711,6 +2784,16 @@ export function getRpcSessionInfos(): SessionInfo[] {
       modified: new Date(lastActivityMs).toISOString(),
       messageCount: messages.length,
       firstMessage: firstUserMessage ? runtimeMessageText(firstUserMessage) || "(no messages)" : "(no messages)",
+      ...(subagent ? {
+        parentSessionId: subagent.parentSessionId,
+        relation: {
+          kind: "subagent" as const,
+          parentSessionId: subagent.parentSessionId,
+          profile: subagent.profile,
+          description: subagent.description,
+          status: session.isRunning() ? "running" as const : subagent.status,
+        },
+      } : {}),
       transient: !persisted,
     });
   }
@@ -1753,6 +2836,19 @@ export function getRunningRpcSessionIds(): string[] {
     if (session.isRunning()) ids.add(session.sessionId || sessionId);
   }
   return [...ids];
+}
+
+/**
+ * Aborts the live run behind `sessionId` (a subagent being deleted mid-run).
+ * Throws when there is no running wrapper, which the caller treats as the
+ * ordinary case: an idle or completed session needs no abort.
+ */
+export function abortSubagent(sessionId: string): void {
+  const wrapper = getRegistry().get(sessionId);
+  if (!wrapper || !wrapper.isAlive() || !wrapper.isRunning()) {
+    throw new Error(`No running subagent for session ${sessionId}`);
+  }
+  void wrapper.send({ type: "abort" }).catch(() => { /* the run was winding down anyway */ });
 }
 
 // ----------------------------------------------------------------------------
@@ -1812,7 +2908,10 @@ export async function startRpcSession(
   cwd: string | undefined,
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
-  const { toolNames, initialModel, thinkingLevel } = options;
+  const { initialModel, thinkingLevel } = options;
+  const requestedToolNames = options.toolNames === undefined
+    ? undefined
+    : validateSessionToolSelection(options.toolNames);
   const registry = getRegistry();
   const locks = getLocks();
 
@@ -1822,6 +2921,19 @@ export async function startRpcSession(
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
 
+  // A wrapper still closing owns the session until it is disposed: a replacement
+  // opened earlier would branch away from appends its session_shutdown still makes
+  // and share the provider resources its dispose() releases. Concurrent starts
+  // share this lock, then the one start that follows it.
+  const closingWait = closingRpcSessionWait(sessionId);
+  if (closingWait) {
+    const waiting: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = closingWait.then(() => {
+      if (locks.get(sessionId) === waiting) locks.delete(sessionId);
+      return startRpcSession(sessionId, sessionFile, cwd, options);
+    });
+    locks.set(sessionId, waiting);
+    return waiting;
+  }
   const starting = (async () => {
     // Some extensions access the SDK's global theme even outside the terminal UI.
     await initTheme(false);
@@ -1833,6 +2945,14 @@ export async function startRpcSession(
         return SessionManager.create(cwd, undefined);
       })();
     const sessionCwd = sessionManager.getCwd();
+    const sessionEntries = sessionManager.getEntries() as unknown as SessionEntry[];
+    // The newest selection in the file wins over a request, so a replacement of a
+    // closing wrapper comes up with the tool policy the session already carries.
+    const persistedToolNames = readSessionToolSelection(sessionEntries);
+    const selectedToolNames = persistedToolNames ?? requestedToolNames;
+    if (persistedToolNames === undefined && requestedToolNames !== undefined) {
+      appendSessionToolSelection(sessionManager, requestedToolNames);
+    }
     const finishStartingSession = trackStartingSession(sessionCwd);
 
     try {
@@ -1841,7 +2961,7 @@ export async function startRpcSession(
 
       // Determine which tools to pass based on requested toolNames.
       let toolsOption: string[] | undefined;
-      if (toolNames !== undefined) {
+      if (selectedToolNames !== undefined) {
         // toolNames === [] -> "all off" (an empty allow-list disables every tool).
         // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
         // set allowedToolNames to coding builtins only, which filtered every
@@ -1849,7 +2969,7 @@ export async function startRpcSession(
         // tool registry — so they were unavailable in omp-web sessions even though the
         // `omp` CLI keeps them. Leaving the allow-list unset lets the SDK register all
         // tools (and activate extension tools); we narrow the ACTIVE set below.
-        toolsOption = toolNames.length === 0 ? [] : undefined;
+        toolsOption = selectedToolNames.length === 0 ? [] : undefined;
       }
 
       // Gate untrusted project code so opening a repository in a browser tab does
@@ -1916,8 +3036,8 @@ export async function startRpcSession(
       // If specific tool names were requested (non-empty), set the active tools to the
       // requested builtin coding tools PLUS all extension/package tools, so installed
       // extensions stay usable in omp-web just like in the `omp` CLI.
-      if (toolNames && toolNames.length > 0) {
-        await session.setActiveToolsByName(withExtensionTools(session, toolNames));
+      if (selectedToolNames && selectedToolNames.length > 0) {
+        await session.setActiveToolsByName(withExtensionTools(session, selectedToolNames));
       }
 
       const wrapper = new AgentSessionWrapper(session, eventBus);
@@ -1927,7 +3047,7 @@ export async function startRpcSession(
       // When all tools are disabled, clear the system prompt entirely.
       // omp's buildSystemPrompt always produces a non-empty prompt even with no
       // tools; keep this forced after extension discovery and reloads as well.
-      if (toolNames?.length === 0) {
+      if (selectedToolNames?.length === 0) {
         wrapper.setForceEmptySystemPrompt(true);
       }
       wrapper.start();
@@ -1936,8 +3056,14 @@ export async function startRpcSession(
       const realSessionFile = inner.sessionFile as string | undefined;
       if (realSessionFile) cacheSessionPath(realSessionId, realSessionFile);
 
+      // A wrapper registered before a hot reload unregisters by id alone when it
+      // finishes; disarm it so it cannot drop this replacement from the registry.
+      const previousWrapper = registry.get(realSessionId);
+      if (previousWrapper && previousWrapper !== wrapper && typeof previousWrapper.onDestroy === "function") {
+        previousWrapper.onDestroy(() => {});
+      }
       registry.set(realSessionId, wrapper);
-      wrapper.beginExtensionBinding({ forceEmptySystemPrompt: toolNames?.length === 0 });
+      wrapper.beginExtensionBinding({ forceEmptySystemPrompt: selectedToolNames?.length === 0 });
 
       return { session: wrapper, realSessionId };
     } finally {

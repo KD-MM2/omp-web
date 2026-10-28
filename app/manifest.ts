@@ -1,10 +1,13 @@
 import type { MetadataRoute } from "next";
 
+export const dynamic = "force-dynamic";
+
 export default function manifest(): MetadataRoute.Manifest {
+  const appName = process.env.OMP_WEB_APP_NAME?.trim() || "omp-web";
   return {
     id: "/",
-    name: "omp-web",
-    short_name: "omp-web",
+    name: appName,
+    short_name: appName,
     description: "Local web view for the omp (oh-my-pi) coding agent",
     start_url: "/",
     scope: "/",

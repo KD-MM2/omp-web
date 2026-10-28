@@ -67,7 +67,7 @@ export async function POST(
 
 // GET /api/agent/[id] - Get current agent state
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -83,6 +83,14 @@ export async function GET(
     }
 
     const state = await session.send({ type: "get_state" });
+    // `?systemPrompt=0` drops the system prompt from the reply: status reads
+    // (usage poll, stream connect, settle and reconcile) never show it, and it
+    // is nearly all of the payload in a large project (#1302).
+    if (new URL(req.url).searchParams.get("systemPrompt") === "0" && state && typeof state === "object") {
+      const copy = { ...(state as Record<string, unknown>) };
+      delete copy.systemPrompt;
+      return NextResponse.json({ running: true, state: copy });
+    }
     return NextResponse.json({ running: true, state });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });

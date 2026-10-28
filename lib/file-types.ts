@@ -1,6 +1,7 @@
 export const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
 export const IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 export const DOCX_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+export const HTML_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 
 export type DocumentPreviewKind = "pdf" | "docx";
 
@@ -26,7 +27,14 @@ export const AUDIO_EXT_TO_MIME: Record<string, string> = {
   aac: "audio/aac",
   flac: "audio/flac",
   weba: "audio/webm",
-  webm: "audio/webm",
+};
+
+export const VIDEO_EXT_TO_MIME: Record<string, string> = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  ogv: "video/ogg",
 };
 
 export const DOCUMENT_EXT_TO_MIME: Record<DocumentPreviewKind, string> = {
@@ -50,6 +58,10 @@ export function getAudioMime(filePath: string): string | null {
   return AUDIO_EXT_TO_MIME[getFileExt(filePath)] ?? null;
 }
 
+export function getVideoMime(filePath: string): string | null {
+  return VIDEO_EXT_TO_MIME[getFileExt(filePath)] ?? null;
+}
+
 export function getDocumentMime(filePath: string): string | null {
   return DOCUMENT_EXT_TO_MIME[getFileExt(filePath) as DocumentPreviewKind] ?? null;
 }
@@ -66,6 +78,10 @@ export function isImagePath(filePath: string): boolean {
 
 export function isAudioPath(filePath: string): boolean {
   return getAudioMime(filePath) !== null;
+}
+
+export function isVideoPath(filePath: string): boolean {
+  return getVideoMime(filePath) !== null;
 }
 
 export function isDocumentPreviewPath(filePath: string): boolean {

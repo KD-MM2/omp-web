@@ -67,6 +67,9 @@ function harness() {
     loadSession: async (...args) => effects.push(["history", ...args]),
     dispatch: (...args) => effects.push(["dispatch", ...args]),
     delay: async () => {},
+    agentStatusUrl: (id) => `/api/agent/${encodeURIComponent(id)}?systemPrompt=0`,
+    onAgentEnd: () => {},
+    onToolEnd: () => {},
     PROMPT_SETTLE_INITIAL_DELAY_MS: 1,
     PROMPT_SETTLE_POLL_MS: 1,
     PROMPT_SETTLE_MAX_MS: 1000,
@@ -156,7 +159,7 @@ for (const name of ["reconcileAgentState", "refreshContextUsage", "handleAgentEv
     const pending = deferred();
     const requested = deferred();
     h.bindings.fetch = async (url) => {
-      assert.equal(url, "/api/agent/runtime%3Ar1");
+      assert.equal(url, "/api/agent/runtime%3Ar1?systemPrompt=0");
       requested.resolve();
       // Hold json(), not just fetch(), to cover ownership across body parsing.
       return { ok: true, json: () => pending.promise };
@@ -227,7 +230,7 @@ test("grace cleanup retries the current runtime instead of closing from a stale 
   timers.shift()();
   await new Promise((resolve) => setImmediate(resolve));
   assertNewRuntime(h);
-  assert.deepEqual(requests, ["/api/agent/runtime%3Ar1", "/api/agent/runtime%3Ar2"]);
+  assert.deepEqual(requests, ["/api/agent/runtime%3Ar1?systemPrompt=0", "/api/agent/runtime%3Ar2?systemPrompt=0"]);
   assert.equal(h.effects.some(([kind]) => kind === "close"), false);
   assert.equal(h.bindings.sdkAgentActiveRef.current, true);
   assert.equal(timers.length, 0);
@@ -252,7 +255,7 @@ for (const name of ["waitForPromptSettlement", "waitForBashSettlement"]) {
     pending.resolve(response({ running: false, state: { sessionId: "b" } }));
     await settling;
     assertNewRuntime(h);
-    assert.deepEqual(requests, ["/api/agent/runtime%3Ar1", "/api/agent/runtime%3Ar2"]);
+    assert.deepEqual(requests, ["/api/agent/runtime%3Ar1?systemPrompt=0", "/api/agent/runtime%3Ar2?systemPrompt=0"]);
     assert.ok(h.effects.some(([kind]) => kind === (name === "waitForPromptSettlement" ? "finish" : "history")));
   });
 

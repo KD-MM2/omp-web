@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { readRegularFileText } from "./regular-file";
 import type * as Undici from "undici";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
@@ -25,6 +28,67 @@ function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
     return undefined;
   }
   return Math.floor(value);
+}
+
+/**
+ * The agent directory omp keeps its global `settings.json` in, resolved the
+ * way the fork SDK's `getAgentDir()` resolves it (its `DirResolver`): a named
+ * profile (`OMP_PROFILE`, else `PI_PROFILE`) wins and pins
+ * `~/.omp/profiles/<name>/agent`; otherwise `PI_CODING_AGENT_DIR` is used
+ * after `path.resolve()`; otherwise `~/.omp/agent`. Resolved here instead of
+ * through the SDK because this module runs in Next.js instrumentation:
+ * importing the SDK there costs about a second of startup time, while
+ * `undici` costs a tenth of one. The opt-in XDG-migrated layout is not
+ * mirrored; the SDK remains the source of truth for it.
+ */
+export function defaultAgentDir(): string {
+  const profile = normalizeProfileName(process.env.OMP_PROFILE ?? process.env.PI_PROFILE);
+  if (profile) return join(homedir(), ".omp", "profiles", profile, "agent");
+  const configured = process.env.PI_CODING_AGENT_DIR;
+  if (configured) return resolve(configured);
+  return join(homedir(), ".omp", "agent");
+}
+
+/** `pi-utils`' normalizeProfileName(), minus the throw: invalid names fall back to the default profile. */
+function normalizeProfileName(profile: string | undefined): string | undefined {
+  const normalized = profile?.trim();
+  if (!normalized || normalized === "default") return undefined;
+  if (!/^[a-z0-9][a-z0-9._-]*$/i.test(normalized) || normalized.includes("..") || normalized.endsWith(".")) {
+    return undefined;
+  }
+  return normalized;
+}
+
+
+/**
+ * The global `httpIdleTimeoutMs`, read the way the pi CLI reads it, so a Web UI
+ * session gets the HTTP idle timeout the user configured instead of the
+ * built-in default. Only the global file counts: the dispatcher is configured
+ * once at startup, before any project is selected, so a project's
+ * `.pi/settings.json` cannot apply here.
+ *
+ * A missing file, a file that does not parse, an absent key, or a value the CLI
+ * would reject yields `undefined`, which leaves `configureHttpDispatcher`'s own
+ * default in place.
+ */
+export function readHttpIdleTimeoutMs(agentDir: string = defaultAgentDir()): number | undefined {
+  let text: string | undefined;
+  try {
+    text = readRegularFileText(join(agentDir, "settings.json"));
+  } catch {
+    return undefined;
+  }
+  if (text === undefined) return undefined;
+
+  let settings: unknown;
+  try {
+    settings = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  } catch {
+    return undefined;
+  }
+  if (typeof settings !== "object" || settings === null) return undefined;
+
+  return parseHttpIdleTimeoutMs((settings as { httpIdleTimeoutMs?: unknown }).httpIdleTimeoutMs);
 }
 
 // Undici can emit an internal Client error while terminating a response body.

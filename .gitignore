@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/test-results/
 
 # next.js
 /.next/
@@ -23,6 +24,8 @@
 # misc
 .DS_Store
 *.pem
+/.agents/
+/skills-lock.json
 
 # debug
 npm-debug.log*
@@ -43,4 +46,7 @@ next-env.d.ts
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/
-src-tauri/server/.remember/
+# stage-desktop.mjs output (bundled runtime + node_modules; 100MB+ binaries)
+src-tauri/server/
+e2e_*.mjs
+components/*.generated.tsx

@@ -1,4 +1,4 @@
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ModelRegistry, Settings } from "@oh-my-pi/pi-coding-agent";
 import { resolveModelScope, type ScopedModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
@@ -47,6 +47,59 @@ function matchesModel(
   return model.provider === ref.provider && model.id === ref.modelId;
 }
 
+const THINKING_LEVEL_SUFFIXES = new Set<ConfiguredThinkingLevel>(CLI_THINKING_LEVELS);
+
+function hasGlob(pattern: string): boolean {
+  return pattern.includes("*") || pattern.includes("?") || pattern.includes("[");
+}
+
+function isSuppressibleUnmatchedGlob(pattern: string): boolean {
+  if (!hasGlob(pattern)) return false;
+  const colonIndex = pattern.lastIndexOf(":");
+  return colonIndex < 0
+    || THINKING_LEVEL_SUFFIXES.has(pattern.slice(colonIndex + 1) as ConfiguredThinkingLevel);
+}
+
+function exactReferenceMatches(pattern: string, models: readonly Model<Api>[]): Model<Api>[] {
+  const normalized = pattern.toLowerCase();
+  const canonical = models.filter(
+    (model) => `${model.provider}/${model.id}`.toLowerCase() === normalized,
+  );
+  if (canonical.length > 0) return canonical;
+  return models.filter((model) => model.id.toLowerCase() === normalized);
+}
+
+// The fuzzy matcher keeps the first hit for a bare id, which silently picks one
+// provider over the other. Fail closed instead so an ambiguous entry is a
+// setting to fix, not a coin flip.
+function assertNoAmbiguousExactPatterns(
+  patterns: readonly string[],
+  models: readonly Model<Api>[],
+): void {
+  for (const pattern of patterns) {
+    if (hasGlob(pattern)) continue;
+
+    let matches = exactReferenceMatches(pattern, models);
+    if (matches.length === 0) {
+      const colonIndex = pattern.lastIndexOf(":");
+      const suffix = colonIndex >= 0 ? pattern.slice(colonIndex + 1) : "";
+      if (THINKING_LEVEL_SUFFIXES.has(suffix as ConfiguredThinkingLevel)) {
+        matches = exactReferenceMatches(pattern.slice(0, colonIndex), models);
+      }
+    }
+
+    if (matches.length > 1) {
+      const references = matches
+        .map((model) => `${model.provider}/${model.id}`)
+        .sort()
+        .join(", ");
+      throw new Error(
+        `Ambiguous enabledModels entry "${pattern}" matches multiple models: ${references}. Use provider/modelId.`,
+      );
+    }
+  }
+}
+
 /**
  * Resolve the visible model list for `patterns`.
  *
@@ -69,14 +122,26 @@ export async function resolveVisibleModels(
     };
   }
 
+  const available = modelRegistry.getAvailable();
+  assertNoAmbiguousExactPatterns(cleaned, available);
+
   const scopedModels = await resolveModelScope(cleaned, modelRegistry, undefined, settings);
 
   // omp's resolver drops unmatched patterns silently. Re-resolve each pattern on
   // its own so a typo surfaces in the UI instead of quietly shrinking the list.
+  // A leftover valid glob after a model was removed is not a chat-level problem
+  // when other enabledModels entries still matched: keep exact and malformed
+  // glob warnings, and keep every no-match warning for a total miss, where the
+  // UI falls back to all available models and the user needs to know the scope
+  // did not apply.
   const warnings: string[] = [];
   await Promise.all(cleaned.map(async (pattern) => {
     const matched = await resolveModelScope([pattern], modelRegistry, undefined, settings);
-    if (matched.length === 0) warnings.push(`No model matches "${pattern}" in enabledModels.`);
+    if (matched.length === 0) {
+      if (scopedModels.length === 0 || !isSuppressibleUnmatchedGlob(pattern)) {
+        warnings.push(`No models match pattern "${pattern}"`);
+      }
+    }
   }));
 
   if (scopedModels.length === 0) {

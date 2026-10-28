@@ -43,7 +43,9 @@ export interface WebThemePalette {
 
 export interface WebThemeConfig {
   names: { dark: string; light: string };
-  palettes: { dark: WebThemePalette; light: WebThemePalette };
+  // omp builds a palette for its two themes; upstream's extra theme ids resolve
+  // through CSS only, so indexing by any ResolvedTheme yields possibly-undefined.
+  palettes: { dark: WebThemePalette; light: WebThemePalette } & Record<string, WebThemePalette | undefined>;
 }
 
 /** Render-affecting settings the transcript view reads from omp's config. */

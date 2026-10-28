@@ -51,6 +51,8 @@ npm install -g omp-web@latest
 omp-web
 ```
 
+If no model provider is configured yet, open the **Models** panel to sign in or add an API key.
+
 **Or install globally:**
 
 ```bash
@@ -161,7 +163,10 @@ Requests to loopback addresses are never proxied, so a local provider (Ollama, L
 - **Route by role**: assign and switch models per scope of work — the roles omp already uses for subagents, plan mode, and commits.
 - **Try different directions safely**: continue from an earlier message or fork a session into a separate route.
 - **Work across branches**: switch Git worktrees from the sidebar so new sessions and the Explorer follow the checkout you choose.
-- **Chat beside the project**: browse files on the left and preview source, docs, images, audio, and PDFs on the right while the agent works.
+- **Chat beside the project**: browse and upload files on the left and preview source, docs, images, audio, and PDFs on the right while the agent works.
+- **Terminal beside the chat**: open a shell in the selected directory from the Explorer; terminal tabs survive panel switches and page refreshes.
+- **Know when runs finish**: opt in to browser web-push notifications and get told a session completed even when the tab is in the background.
+- **Read tool calls at a glance**: each tool call lists its arguments as compact rows, no JSON spelunking.
 - **See session state clearly**: context usage, cost, compaction state, and system prompt details are visible from the top bar.
 - **Configure less from the terminal**: manage providers, logins/API keys, model tests, plugins, and skill switches from the web UI.
 - **Use the interface in your language**: switch between the supported UI languages from the top bar.
@@ -225,6 +230,30 @@ list. If no listener cancels the extension event, Pi Web preserves the
 browser's native context menu. This hook is browser-side and independent of
 Pi agent extensions.
 
+### Extension Session Liveness
+
+Server-side extensions with detached work can prevent automatic idle
+session eviction through the versioned global registry:
+
+```js
+const liveness = globalThis[Symbol.for("@agegr/pi-web/session-liveness/v1")];
+const release = liveness?.version === 1
+  ? liveness.register({
+      name: "my-extension",
+      sessionId,
+      sessionFile: sessionFile || undefined,
+      isActive: () => detachedJobs.size > 0,
+    })
+  : () => {};
+```
+
+Register once per active extension session and call the returned idempotent
+`release` function on session shutdown, replacement, or reload. `isActive`
+must be synchronous, cheap, and scoped to the supplied exact session id or
+file. Provider errors fail safe by preserving that session. This lease only
+affects automatic idle eviction; explicit shutdown and Stop fallback cleanup
+still take precedence.
+
 ## Development
 
 ```bash
@@ -232,9 +261,7 @@ bun install
 bun run dev
 ```
 
-The local dev server runs at [http://127.0.0.1:30141](http://127.0.0.1:30141).
-
-Common checks:
+The development server runs at [http://127.0.0.1:30141](http://127.0.0.1:30141). Run the common checks with:
 
 ```bash
 bun run typecheck
@@ -287,7 +314,11 @@ To enable that, configure two repository secrets — `TAURI_SIGNING_PRIVATE_KEY`
 macOS builds are unsigned: the first launch needs right-click → Open (Gatekeeper),
 subsequent auto-updates are written by the app itself.
 
-## Project Structure
+Before starting on a feature, read [Contributing](./CONTRIBUTING.md) for what is in scope and the pull request checklist.
+
+Contributor guides: [Internationalization](./docs/i18n.md) and [Release process](./docs/release.md).
+
+## Repository Layout
 
 ```text
 app/
@@ -297,19 +328,21 @@ app/
     cwd/browse/     # browsable server directory listing
     cwd/validate/   # custom working directory validation
     default-cwd/    # omp default working directory lookup
-    files/          # file listing, reading, preview, and watching
+    files/          # file listing, reading, upload, preview, and watching
     home/           # current user home directory
     model-roles/    # read/write omp's modelRoles (default/smol/slow/plan/…)
     models/         # available models, default model, thinking levels, roles
     models-config/  # read/write models.yml and test models
     plugins/        # omp plugin install/remove/enable/disable
+    push/           # web-push VAPID config and subscriptions
     sessions/       # session reads, rename, delete, context, HTML export
     skills/         # skill listing, search, install, enable/disable
+    terminal/       # workspace shell terminal sessions
 components/
   AppShell.tsx        # main layout, URL state, top panels, file tabs
   SessionSidebar.tsx  # project selector, session tree, Explorer
   DirectoryPicker.tsx # browsable and editable working-directory picker
-  ChatWindow.tsx      # messages, SSE, image drag/drop, minimap
+  ChatWindow.tsx      # messages, SSE, image drag/drop
   ChatInput.tsx       # input bar, model/role/tools/thinking/compact/slash controls
   MessageView.tsx     # message, thinking, tool call/result rendering
   ModelsConfig.tsx    # provider and auth configuration panel
@@ -317,6 +350,7 @@ components/
   SkillsConfig.tsx    # skill management panel
   FileExplorer.tsx    # file tree
   FileViewer.tsx      # source, diff, image, audio, PDF, DOCX preview
+  TerminalPanel.tsx   # shell terminal tab in the file panel
 lib/
   directory-browser.ts # directory normalization and safe listing helpers
   http-dispatcher.ts  # HTTP(S) proxy setup for server-side fetch
@@ -325,6 +359,8 @@ lib/
   omp-runtime.ts      # shared Settings + AuthStorage + ModelRegistry
   omp-types.ts        # structural view of omp's AgentSession
   project-trust.ts    # gates a project's executable resources
+  terminal-manager.ts # server-side PTY sessions behind /api/terminal
+  web-push.ts       # VAPID keys and sending web-push notifications
   rpc-manager.ts      # AgentSessionWrapper lifecycle and global registry
   session-reader.ts   # parses .jsonl session files and branch contexts
   normalize.ts        # normalizes toolCall field names
@@ -341,3 +377,9 @@ bin/
   runtime.js          # Node/Bun version checks and Bun discovery
 instrumentation.ts    # initializes the server HTTP dispatcher
 ```
+
+See [AGENTS.md](./AGENTS.md) for the architecture notes and detailed file map.
+
+## License
+
+[MIT](./LICENSE)

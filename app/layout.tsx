@@ -1,7 +1,11 @@
 import type { Metadata, Viewport } from "next";
 import { PwaRegistration } from "@/components/PwaRegistration";
+import { THEME_INIT_SCRIPT } from "@/lib/theme";
 import "katex/dist/katex.min.css";
 import "./globals.css";
+import "./settings.css";
+import "./sidebar.css";
+import "./sidebar-menu.css";
 
 export const metadata: Metadata = {
   title: "omp-web",
@@ -58,11 +62,11 @@ export default function RootLayout({
         <meta name="google" content="notranslate" />
         <script
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var r=document.documentElement,m=localStorage.getItem("omp-theme")==="dark"?"dark":"light",c=JSON.parse(localStorage.getItem("omp-theme-config")||"null"),p=c&&c.palettes&&c.palettes[m];r.dataset.ompThemeMode=m;if(p){Object.keys(p.variables).forEach(function(k){r.style.setProperty(k,p.variables[k])});r.dataset.ompThemeName=p.name;r.style.colorScheme=p.colorScheme;r.classList.toggle("dark",p.colorScheme==="dark")}else{r.classList.toggle("dark",m==="dark")}}catch(e){}})();`,
+            __html: `${THEME_INIT_SCRIPT}(function(){try{var r=document.documentElement,m=r.classList.contains("dark")?"dark":"light",c=JSON.parse(localStorage.getItem("omp-theme-config")||"null"),p=c&&c.palettes&&c.palettes[m];r.dataset.ompThemeMode=m;if(p){Object.keys(p.variables).forEach(function(k){r.style.setProperty(k,p.variables[k])});r.dataset.ompThemeName=p.name;r.style.colorScheme=p.colorScheme;r.classList.toggle("dark",p.colorScheme==="dark")}}catch(e){}})();`,
           }}
         />
       </head>
-      <body translate="no" className="notranslate">
+      <body translate="no" className="notranslate" suppressHydrationWarning>
         {children}
         <PwaRegistration />
       </body>

@@ -27,6 +27,12 @@ export interface SlashCommandInfo {
   source: SlashCommandSource;
   location?: "user" | "project" | "path";
   path?: string;
+  /**
+   * Builtin palette entries only: Enter submits them while a run is active.
+   * Extension- and file-sourced commands never set it, so they keep needing a
+   * second Enter mid-stream.
+   */
+  availableWhileStreaming?: boolean;
 }
 
 export interface ModelLike {
@@ -91,6 +97,11 @@ interface ExtensionRunnerLike {
   getExtensionPaths?(): string[];
   emit?(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown>;
   setUIContext?(uiContext?: unknown, mode?: "tui" | "rpc" | "json" | "print"): void;
+  /** Present on SDK runners whose host wires actions through the shared initializer. */
+  initialize?: unknown;
+  getCommand?(name: string): { handler: (ctx: unknown) => unknown } | undefined;
+  createCommandContext?(): unknown;
+  emitError?(error: { extensionPath?: string; event?: string; error: string; stack?: string }): void;
 }
 
 type DialogOptionsLike = {
@@ -159,6 +170,14 @@ export interface AgentSessionLike {
   readonly sessionManager: SessionManager;
   readonly settings: Settings;
   readonly agent: { state?: { systemPrompt?: string | string[]; thinkingLevel?: string } };
+  /** The session-level system prompt the SDK renders from its current options. */
+  readonly systemPrompt?: string;
+  /** Shell/project settings the SDK exposes to its host. */
+  readonly settingsManager?: {
+    getShellPath?: () => string | undefined;
+    setProjectTrusted?: (trusted: boolean) => void;
+    getDefaultTools?: () => string[] | undefined;
+  };
   readonly extensionRunner: ExtensionRunnerLike | undefined;
   readonly promptTemplates: readonly PromptTemplateLike[];
   readonly skills: readonly SkillLike[];
@@ -171,9 +190,18 @@ export interface AgentSessionLike {
     images?: Array<{ type: "image"; data: string; mimeType: string }>;
     streamingBehavior?: "steer" | "followUp";
     userInitiated?: boolean;
+    source?: string;
+    /** pi SDK: called once the submission passes synchronous preflight. */
+    preflightResult?: (disposition?: unknown) => void;
+    /** omp SDK: called once the submission is admitted (turn setup or command route). */
+    onPromptAdmitted?: () => void;
   }): Promise<boolean>;
   abort(options?: { reason?: string }): Promise<void>;
-  executeBash(command: string, onChunk?: (chunk: string) => void, options?: { excludeFromContext?: boolean }): Promise<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>;
+  executeBash(
+    command: string,
+    onChunk?: (chunk: string) => void,
+    options?: { excludeFromContext?: boolean; operations?: unknown },
+  ): Promise<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>;
   abortBash(): void;
   readonly isBashRunning: boolean;
   setModel(model: ModelLike, role?: string, options?: { selector?: string; thinkingLevel?: string; persist?: boolean }): Promise<{ switched: boolean }>;
