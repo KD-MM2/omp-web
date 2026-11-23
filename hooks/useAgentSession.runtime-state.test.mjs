@@ -165,7 +165,7 @@ for (const name of ["reconcileAgentState", "refreshContextUsage", "handleAgentEv
       return { ok: true, json: () => pending.promise };
     };
     const fn = callback(name, h.bindings);
-    const result = fn(name === "handleAgentEvent" ? { type: "agent_end" } : "b");
+    const result = fn(name === "handleAgentEvent" ? { type: "agent_end", isTerminal: false } : "b");
     await requested.promise;
     installNewRuntime(h);
     pending.resolve({ running: false, state: { sessionId: "b", contextUsage: { percent: 99 } } });

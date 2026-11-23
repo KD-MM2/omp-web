@@ -2,7 +2,7 @@ export interface ToolEntry {
   name: string;
   description: string;
   active: boolean;
-  /** Active, but left out of requests: the model calls it only from codemode scripts. */
+  /** Enabled but not declared at the top level (bash commands or eval/codemode tools). */
   declarationHidden?: boolean;
   parameters?: Record<string, unknown>;
   promptGuidelines?: string[];

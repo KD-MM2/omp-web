@@ -70,6 +70,7 @@ app/api/
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any command
   agent/[id]/events/route.ts      GET SSE stream
+  agent/[id]/form-media/[token]/[index]/route.ts  GET a picture of an open ask form
   agent/running/route.ts          GET currently-running session ids
   agent/running/events/route.ts   GET SSE stream of currently-running session ids
   auth/all-providers/route.ts     GET API-key provider list
@@ -104,6 +105,8 @@ lib/
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
+  form-dialog.ts       ask form: SDK parse -> browser shape, browser state -> form data, picture loading
+  form-dialog-types.ts client-safe wire types of the ask form
   file-upload-client.ts browser upload to /api/files, shared by explorer and chat drops
   markdown.ts          shared markdown helpers
   model-roles.ts       omp's model roles, read/written for the browser
@@ -127,6 +130,7 @@ lib/
 
 components/
   AccessConfig.tsx    password lock panel inside the settings modal
+  FormDialog.tsx      the ask tool's HTML form, drawn natively (ui.formDialog)
   AppShell.tsx        layout + URL state + tab management
   SessionSidebar.tsx  session tree + FileExplorer
   ChatWindow.tsx      chat composition + completion sound wrapper
@@ -249,6 +253,33 @@ with. Every lookup is bound to the session's cwd, because the CLI's default
 (`getProjectDir()`) is the server's own directory here, not the project's.
 Project-local prompt files load for untrusted projects too: they are data, like
 skills and rules (`docs/project-trust.md`).
+
+### The `ask` tool is a form, drawn by `ui.formDialog` (SDK >= 18.18.3)
+`ask` takes one HTML `<form>` (`{ html }`). A host without `ui.formDialog` gets the
+SDK's field-by-field fallback through `select`/`input`/`editor`, which loses the
+model's preselections and checkbox state in the browser, so `rpc-manager.ts`
+implements `formDialog` and `components/FormDialog.tsx` draws the form.
+
+- The server parses the HTML with the SDK's own `parseHtmlForm` and ships a reduced
+  shape (`lib/form-dialog-types.ts`): no raw HTML reaches the browser, so nothing the
+  model writes can run there. `<svg>` and `<img>` become numbered `media` blocks.
+- Pictures come from `GET /api/agent/[id]/form-media/[token]/[index]`: the server loads
+  them with the SDK's `loadMedia`/`svgMedia` (`@oh-my-pi/pi-tui/media`; URL, data URI or path from the
+  session cwd, 10 MB cap) and serves bytes with a sandboxing CSP. The browser never
+  contacts a host the model chose. The token exists only while the dialog is open.
+- The browser answers with its raw control state (`FormDialogState`); the server turns
+  it into form data with the SDK's `choiceValue`/`textValue`, so the TUI and the
+  browser agree on what a form submits. Validation is the browser's own constraint
+  validation (`required`, `min`/`max`, `pattern`, ...), plus a required check for
+  choice groups.
+- `ask.timeout` is the user's setting; unset, the form is not timed. When set, the
+  browser submits its live values at the deadline (`timedOut`); the server's timer
+  runs `FORM_TIMEOUT_GRACE_MS` later and submits the form's defaults if no browser
+  answered.
+- `form` is a blocking request (`lib/extension-ui-queue.ts`), like `select` and
+  `input`, so a parked form raises the attention notification.
+- The older `askDialog` / `method: "ask"` path stays for extensions that call
+  `ui.askDialog`; the `ask` tool no longer uses it.
 
 ### SSE reconnect on page refresh mid-stream
 On `ChatWindow` mount, `GET /api/agent/[id]` is called. If `state.isStreaming === true`, SSE is reconnected automatically. `thinkingLevel` and `isCompacting` are also synced from this response.
@@ -415,3 +446,13 @@ This project is indexed by GitNexus as **omp-web** (2786 symbols, 7305 relations
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

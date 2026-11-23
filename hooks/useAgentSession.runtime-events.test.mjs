@@ -4,6 +4,7 @@ import test from "node:test";
 import ts from "typescript";
 import { isBlockingExtensionUiRequest } from "../lib/browser-notifications.ts";
 import { normalizeToolCalls } from "../lib/normalize.ts";
+import { toClientAgentEvent } from "../lib/agent-event-wire.ts";
 
 const source = await readFile(new URL("./useAgentSession.ts", import.meta.url), "utf8");
 const ast = ts.createSourceFile("useAgentSession.ts", source, ts.ScriptTarget.Latest, true);
@@ -25,6 +26,7 @@ collect(ast);
 const callbackNames = [
   "closeEvents", "followSessionIdentity", "followRuntimeState", "cancelEventStreamGrace",
   "handleExtensionUiRequest", "handleAgentEvent", "connectEvents", "ensureEventsConnected", "applyContextUsage", "refreshContextUsage",
+  "settleUiStage", "notifyPromptStage", "finishPromptWithoutStream", "reconcileAgentState",
 ];
 const helperNames = ["streamReducer", "EventStreamConnectionError"];
 for (const name of callbackNames) assert.ok(callbacks.has(name), `Missing callback: ${name}`);
@@ -89,6 +91,14 @@ function harness({ sessionId = "a", runtimeId = "runtime:r1" } = {}) {
     handleAgentEventRef: { current: null },
     agentRunningRef: { current: false },
     sdkAgentActiveRef: { current: false },
+    rpcPromptPendingRef: { current: false },
+    notifiedPromptRunIdRef: { current: -1 },
+    optimisticUserMessageKeyRef: { current: null },
+    normalizeQueuedMessages: (queue) => queue ?? { steering: [], followUp: [] },
+    mergeSubagentSnapshots: (_current, incoming) => incoming,
+    loadSession: async () => {},
+    scheduleEventStreamClose: (id) => effects.push(["grace", id]),
+    onAgentEnd: (end) => effects.push(["completion", end]),
     EVENT_STREAM_CONNECT_TIMEOUT_MS: 5_000,
     sessionHookMountedRef: { current: true },
     contextUsageAppliedIdRef: { current: 0 },
@@ -114,7 +124,8 @@ function harness({ sessionId = "a", runtimeId = "runtime:r1" } = {}) {
     },
   };
   for (const name of ["AgentRunning", "AgentPhase", "ExtensionDialog", "ExtensionCustomUi",
-    "ExtensionStatuses", "ExtensionWidgets", "CurrentModelOverride", "ContextUsage"]) {
+    "ExtensionStatuses", "ExtensionWidgets", "CurrentModelOverride", "ContextUsage",
+    "RetryInfo", "IsCompacting", "QueuedMessages", "Subagents", "GoalStatus", "SystemPrompt"]) {
     bindings[`set${name}`] = (value) => {
       state[name] = typeof value === "function" ? value(state[name]) : value;
       effects.push([name, state[name]]);
@@ -645,4 +656,57 @@ test("a canonical source can discover R3 on a later reconnect after accepting it
   await tick();
   assert.equal(ensuring.status, "fulfilled");
   assert.equal(h.sources.length, 1);
+});
+
+test("terminal SDK completion returns to send immediately and idle reconciliation cannot notify twice", async () => {
+  const h = harness();
+  h.bindings.rpcPromptPendingRef.current = true;
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: true, messages: [] }));
+  h.handleAgentEvent({ type: "prompt_done" });
+  assert.equal(h.state.AgentRunning, false, "the composer must return to send without a poll");
+  assert.equal(h.bindings.sdkAgentActiveRef.current, false);
+  assert.equal(h.effects.filter(([kind]) => kind === "completion").length, 1);
+  h.replies.push(response({ running: false, state: { isStreaming: false, isPromptRunning: false } }));
+  await h.reconcileAgentState("a");
+  await h.finishPromptWithoutStream("a");
+  h.handleAgentEvent({ type: "prompt_done" });
+  assert.equal(h.effects.filter(([kind]) => kind === "completion").length, 1);
+});
+
+test("a newer continuation remains busy when the original prompt completes", () => {
+  const h = harness();
+  h.bindings.rpcPromptPendingRef.current = true;
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: true, messages: [] }));
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent({ type: "prompt_done" });
+  assert.equal(h.state.AgentRunning, true);
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: true, messages: [] }));
+  assert.equal(h.state.AgentRunning, false);
+  assert.equal(h.effects.filter(([kind]) => kind === "completion").length, 2);
+});
+
+test("non-terminal SDK ends do not settle or notify an extension run", () => {
+  const h = harness();
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: false, messages: [] }));
+  assert.equal(h.state.AgentRunning, true);
+  assert.equal(h.effects.filter(([kind]) => kind === "completion").length, 0);
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: true, messages: [] }));
+  assert.equal(h.state.AgentRunning, false);
+  assert.equal(h.effects.filter(([kind]) => kind === "completion").length, 1);
+});
+
+test("a stopped prompt returns to send without announcing a successful completion", () => {
+  const h = harness();
+  h.bindings.rpcPromptPendingRef.current = true;
+  h.handleAgentEvent({ type: "agent_start" });
+  h.handleAgentEvent(toClientAgentEvent({ type: "agent_end", isTerminal: true, aborted: true, messages: [] }));
+  h.handleAgentEvent({ type: "prompt_done", aborted: true });
+  assert.equal(h.state.AgentRunning, false);
+  assert.deepEqual(h.effects.filter(([kind]) => kind === "completion"), [
+    ["completion", { aborted: true, sessionId: "a" }],
+  ]);
 });

@@ -15,10 +15,9 @@ import { createHash } from "node:crypto";
 // named binding is captured once when jiti loads this module under bun, so a
 // test's mock of the fs object would miss it; the property lookup stays live.
 import fsDefault, { existsSync, readFileSync } from "node:fs";
-import { open, readdir, stat } from "node:fs/promises";
+import { open, readdir, realpath, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import type { Dirent } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
 import { writePrivateFileAtomicSync } from "./atomic-file";
 
@@ -37,6 +36,8 @@ export interface ScannedSessionInfo {
 	firstMessage: string;
 	status?: SessionRowStatus;
 	parentSessionPath?: string;
+	/** Id of the session whose conversation this one continues (header `continuationOf`). */
+	continuationOf?: string;
 	/** True when only header/stat metadata was available for this listing. */
 	detailsPending?: boolean;
 }
@@ -88,7 +89,7 @@ function isRecord(value: unknown): value is RawEntry {
 
 // Bump on any change to what foldEntry() counts: a resumed scan adds to totals
 // counted under the rules its prefix was scanned with.
-const INDEX_FORMAT_VERSION = 3;
+const INDEX_FORMAT_VERSION = 4;
 /** A trailing throttle: a run's rescans rewrite the index once per window. */
 const INDEX_PERSIST_DELAY_MS = 5_000;
 const RESUME_SAMPLE_BYTES = 512;
@@ -196,6 +197,7 @@ async function deferredSessionInfo(
 		messageCount: 0,
 		firstMessage: "",
 		...(typeof header.parentSession === "string" ? { parentSessionPath: header.parentSession } : {}),
+		...(typeof header.continuationOf === "string" ? { continuationOf: header.continuationOf } : {}),
 		detailsPending: true,
 	};
 }
@@ -221,6 +223,7 @@ interface SessionHeader {
 	cwd: string;
 	created: Date;
 	parentSessionPath?: string;
+	continuationOf?: string;
 	/** NaN unless the header's timestamp is a string. */
 	time: number;
 	/** The header line and its newline, kept when a later scan may resume. */
@@ -244,6 +247,7 @@ function readHeader(entry: RawEntry, head: Buffer | undefined): SessionHeader {
 		cwd: typeof entry.cwd === "string" ? entry.cwd : "",
 		created: new Date(entry.timestamp as string),
 		parentSessionPath: typeof entry.parentSession === "string" ? entry.parentSession : undefined,
+		continuationOf: typeof entry.continuationOf === "string" ? entry.continuationOf : undefined,
 		time: typeof entry.timestamp === "string" ? new Date(entry.timestamp).getTime() : NaN,
 		// A resumed scan rebuilds the header from the row, which holds it
 		// faithfully only for a string id and timestamp.
@@ -455,6 +459,7 @@ async function scanSessionFile(
 				cwd: info.cwd,
 				created: new Date(info.created.getTime()),
 				parentSessionPath: info.parentSessionPath,
+				continuationOf: info.continuationOf,
 				time: info.created.getTime(),
 				head: resumed.head,
 			};
@@ -509,7 +514,7 @@ async function scanSessionFile(
 			if (!parseLines(scan.rest, null)) return null;
 		}
 		if (!header) return null;
-		const { id, cwd, created, parentSessionPath, head } = header;
+		const { id, cwd, created, parentSessionPath, continuationOf, head } = header;
 
 		return {
 			info: {
@@ -518,6 +523,7 @@ async function scanSessionFile(
 				cwd,
 				title: resolveScanTitle(totals),
 				parentSessionPath,
+				continuationOf,
 				created,
 				modified: stats.mtime,
 				messageCount: totals.messageCount,
@@ -551,29 +557,40 @@ export async function scanSessionFileInfo(
 	return (await scanSessionFile(filePath))?.info ?? null;
 }
 
-// Mirrors the SDK's listing scope: `readdir` Dirents, with symlinks (of either
-// kind) skipped exactly like the SDK's isFile()/isDirectory() checks skip them.
-// Following one would make the sidebar show sessions pi itself never lists.
+// Mirrors the SDK's listing scope (`listAllSessions`, 18.12.x): a project bucket
+// that is itself a symlink is skipped (it could leave the sessions root or list
+// a bucket twice), transcripts inside a real bucket may be symlinks, and each
+// physical file is listed once, by its first-seen name.
 async function enumerateSessionFiles(sessionsDir: string): Promise<string[]> {
-	let dirs: Dirent[];
+	let buckets;
 	try {
-		dirs = (await readdir(sessionsDir, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+		buckets = await readdir(sessionsDir, { withFileTypes: true });
 	} catch {
 		return [];
 	}
 
 	const files: string[] = [];
-	for (const dir of dirs) {
-		const dirPath = join(sessionsDir, dir.name);
+	for (const bucket of buckets) {
+		if (bucket.isSymbolicLink() || !bucket.isDirectory()) continue;
+		const bucketPath = join(sessionsDir, bucket.name);
 		try {
-			for (const f of await readdir(dirPath, { withFileTypes: true })) {
-				if (f.isFile() && f.name.endsWith(".jsonl")) files.push(join(dirPath, f.name));
+			for await (const name of new Bun.Glob("*.jsonl").scan({ cwd: bucketPath, followSymlinks: true })) {
+				files.push(join(bucketPath, name));
 			}
 		} catch {
-			// unreadable project dir: same skip-as-absent semantics as the SDK
+			// unreadable bucket: same skip-as-absent semantics as the SDK
 		}
 	}
-	return files;
+
+	const seenPhysicalFiles = new Set<string>();
+	const unique: string[] = [];
+	for (const file of files) {
+		const physicalPath = await realpath(file).catch(() => resolve(file));
+		if (seenPhysicalFiles.has(physicalPath)) continue;
+		seenPhysicalFiles.add(physicalPath);
+		unique.push(file);
+	}
+	return unique;
 }
 
 const MAX_CONCURRENT_SCANS = 10;
@@ -640,6 +657,7 @@ function loadPersistedIndex(): void {
 				typeof info.firstMessage !== "string" ||
 				(info.title !== undefined && typeof info.title !== "string") ||
 				(info.parentSessionPath !== undefined && typeof info.parentSessionPath !== "string") ||
+				(info.continuationOf !== undefined && typeof info.continuationOf !== "string") ||
 				(info.assistantTurns !== undefined && (typeof info.assistantTurns !== "number" || !Number.isSafeInteger(info.assistantTurns) || info.assistantTurns < 0)) ||
 				(info.size !== undefined && (typeof info.size !== "number" || !Number.isSafeInteger(info.size) || info.size < 0)) ||
 				(info.status !== undefined && info.status !== "complete" && info.status !== "interrupted" && info.status !== "aborted" && info.status !== "error" && info.status !== "pending" && info.status !== "unknown") ||
@@ -657,6 +675,7 @@ function loadPersistedIndex(): void {
 					cwd: info.cwd,
 					title: info.title,
 					parentSessionPath: info.parentSessionPath,
+					continuationOf: info.continuationOf,
 					firstMessage: info.firstMessage,
 					messageCount: info.messageCount,
 					...(info.assistantTurns !== undefined ? { assistantTurns: info.assistantTurns } : {}),

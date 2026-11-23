@@ -17,6 +17,7 @@ import { MessageView } from "./MessageView";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
+import { FormDialog } from "./FormDialog";
 import { AnsiText } from "./AnsiText";
 import { OmpWordmark } from "./OmpWordmark";
 import { useI18n } from "@/hooks/useI18n";
@@ -1768,7 +1769,7 @@ function NoticeShelf({ notices, floating = false, onPauseChange }: { notices: No
 
 type ExtensionDialogRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" | "ask" | "plan_review" }
+  { method: "select" | "confirm" | "input" | "editor" | "ask" | "form" | "plan_review" }
 >;
 
 function getExtensionDialogSummary(request: ExtensionDialogRequest): string | undefined {
@@ -1886,6 +1887,10 @@ function ExtensionDialog({
       onRespond(request, { value });
     }
   };
+  if (request.method === "form") {
+    return <FormDialog request={request} onRespond={(response) => onRespond(request, response)} />;
+  }
+
   if (request.method === "ask") {
     const canSubmit = request.questions.every((question) =>
       (selectedOptions[question.id]?.length ?? 0) > 0
@@ -2435,6 +2440,11 @@ function ExtensionDialog({
                 >
                   <div inert>
                     <MarkdownBody>{option}</MarkdownBody>
+                    {request.optionDetails?.[index]?.description && (
+                      <span style={{ display: "block", marginTop: 3, color: "var(--text-muted)", fontSize: 11, lineHeight: 1.45 }}>
+                        {request.optionDetails[index].description}
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}
