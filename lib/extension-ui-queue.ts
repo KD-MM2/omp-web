@@ -13,7 +13,7 @@ import type { BlockingExtensionUiRequest, ExtensionUiRequest } from "./types";
  */
 
 /**
- * A request whose answer gates the run: pi's select / confirm / input / editor,
+ * A request whose answer gates the run: pi's select / confirm / input / editor / form,
  * or a custom overlay that has not been closed. Everything else (notify,
  * setStatus, setWidget, setTitle, …) only tells the UI something. The TUI blocks
  * on exactly these methods, so a host can tell a session parked on a person from
@@ -27,6 +27,7 @@ export function isBlockingExtensionUiRequest(
     case "confirm":
     case "input":
     case "editor":
+    case "form":
       return true;
     case "custom":
       return request.closed !== true;

@@ -195,7 +195,11 @@ export function toClientAgentEvent(
     || event.type === "tool_execution_end"
   ) return toClientToolExecutionEvent(event);
 
-  if (event.type === "agent_end") return { type: "agent_end" };
+  if (event.type === "agent_end") return {
+    type: "agent_end",
+    ...(typeof event.isTerminal === "boolean" ? { isTerminal: event.isTerminal } : {}),
+    ...(typeof event.aborted === "boolean" ? { aborted: event.aborted } : {}),
+  };
   return event;
 }
 

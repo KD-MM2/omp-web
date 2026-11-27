@@ -192,7 +192,7 @@ function mergeSubagentSnapshots(current: SubagentSnapshot[], incoming: SubagentS
 
 type ExtensionUiDialogRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" | "ask" | "plan_review" }
+  { method: "select" | "confirm" | "input" | "editor" | "ask" | "form" | "plan_review" }
 >;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
 export type NoticeType = "info" | "success" | "warning" | "error";
@@ -231,7 +231,7 @@ export type BuiltinSlashCommandResult =
   | { handled: false }
   | { handled: true; message?: string; error?: string; prompt?: string; action?: "openSessionStats" | "openSettings" };
 
-/** A run ended; `aborted` when it was stopped rather than finished (pi's `agent_settled.aborted`). */
+/** A run ended; `aborted` when it was stopped rather than finished. */
 export interface AgentEndInfo {
   aborted: boolean;
   /** omp: the session whose run settled, for callers that tag completion notices per session. */
@@ -1369,6 +1369,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "input":
       case "editor":
       case "ask":
+      case "form":
       case "plan_review":
         setExtensionDialog(request);
         break;
@@ -1425,11 +1426,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return wasRunning;
   }, []);
 
-  const notifyPromptStage = useCallback((runId: number) => {
+  const notifyPromptStage = useCallback((runId: number, aborted = false) => {
     if (!mountedRef.current || notifiedPromptRunIdRef.current === runId) return false;
     notifiedPromptRunIdRef.current = runId;
-    // omp has no aborted flag on its settle paths yet; completion always announces.
-    onAgentEnd?.({ aborted: false, sessionId: sessionIdRef.current ?? undefined });
+    onAgentEnd?.({ aborted, sessionId: sessionIdRef.current ?? undefined });
     return true;
   }, [onAgentEnd]);
 
@@ -1753,10 +1753,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setRetryInfo(null);
         dispatch({ type: "start" });
         break;
-      case "agent_end":
-        // One logical prompt can emit multiple agent_end events before retrying,
-        // compacting, or continuing messages queued by extension handlers.
-        // Keep the stream open until prompt_done/agent_settled and the idle grace.
+      case "agent_end": {
+        // Non-terminal ends precede retries, compaction, or queued continuations.
         if (!agentRunningRef.current) break;
         setAgentPhase(null);
         setRetryInfo(null);
@@ -1781,40 +1779,35 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             })
             .catch(() => {});
         }
+        if (event.isTerminal !== false) {
+          const agentWasActive = sdkAgentActiveRef.current;
+          sdkAgentActiveRef.current = false;
+          if (agentWasActive && !rpcPromptPendingRef.current) {
+            const sid = sessionIdRef.current;
+            const wasRunning = settleUiStage();
+            setIsCompacting(false);
+            if (sid) scheduleEventStreamClose(sid);
+            if (wasRunning) onAgentEnd?.({ aborted: event.aborted === true, sessionId: sid ?? undefined });
+          }
+        }
         break;
+      }
       case "goal_status":
         setGoalStatus((event.status as GoalStatusInfo | null | undefined) ?? null);
         break;
-      case "agent_settled": {
-        const agentWasActive = sdkAgentActiveRef.current;
-        sdkAgentActiveRef.current = false;
-        if (!agentWasActive || rpcPromptPendingRef.current) break;
-
-        const sid = sessionIdRef.current;
-        const wasRunning = settleUiStage();
-        setIsCompacting(false);
-        if (sid) {
-          void loadSession(sid);
-          scheduleEventStreamClose(sid);
-        }
-        // omp's agent_settled carries no aborted flag unless the bridge adds one.
-        if (wasRunning) onAgentEnd?.({ aborted: "aborted" in event && event.aborted === true, sessionId: sessionIdRef.current ?? undefined });
-        break;
-      }
       case "prompt_done":
         {
           const runId = promptRunIdRef.current;
           const promptWasPending = rpcPromptPendingRef.current;
           rpcPromptPendingRef.current = false;
           optimisticUserMessageKeyRef.current = null;
-          const firstNotification = notifyPromptStage(runId);
+          const firstNotification = notifyPromptStage(runId, event.aborted === true);
           if (!promptWasPending && !firstNotification) break;
 
           const sid = sessionIdRef.current;
           if (sid) void loadSession(sid);
-          // An extension-injected agent may already have started before the
-          // command's prompt_done. Keep that active stage visible and let its
-          // agent_settled event perform the next completion transition.
+          // A newer continuation may have started before this prompt_done.
+          // Its terminal agent_end owns the next completion transition.
           if (!sdkAgentActiveRef.current) {
             settleUiStage();
             if (sid) scheduleEventStreamClose(sid);

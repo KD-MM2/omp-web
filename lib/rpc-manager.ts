@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { getSetting } from "@/lib/omp-settings";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
 import {
   applyResolvedSystemPromptInputs,
   createAgentSession,
@@ -11,11 +12,13 @@ import {
   SessionManager,
   Theme,
 } from "@oh-my-pi/pi-coding-agent";
+import { type ExtensionUISelectItem, getExtensionUISelectOptionLabel } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
 import { BUILTIN_SLASH_COMMAND_DEFS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { executeAcpBuiltinSlashCommand, type AcpBuiltinSlashCommandResult } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { discoverCustomToolPaths } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { toWireEvent } from "@oh-my-pi/pi-coding-agent/session/loop-end-wire";
 import { readPlanFile } from "@oh-my-pi/pi-coding-agent/plan-mode/plan-files";
 import {
   readRpcSubagentTranscript,
@@ -49,10 +52,12 @@ import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "./omp-types";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./omp-types";
 import { GoalModeController } from "./goal-mode";
+import { formDataFromState, loadFormMedia, parseFormDialogState, prepareFormDialog, type FormDialogAnswer, type FormMediaSource } from "./form-dialog";
 import type {
   ExtensionAskDialogResult,
   ExtensionUiRequest,
   ExtensionUiResponse,
+  ExtensionUiSelectOptionDetail,
   ExtensionWidgetItem,
   SessionInfo,
   SessionMessageEntry,
@@ -137,6 +142,18 @@ type ExtensionUiRequestBody = Record<string, unknown> & {
   expiresAt?: number;
 };
 
+// After a form's ask timeout the browser submits what is typed; the server only
+// steps in with the defaults once this much later, when no browser answered.
+const FORM_TIMEOUT_GRACE_MS = 3_000;
+
+/** Mirrors omp's RPC `select` wire: labels stay strings, descriptions travel positionally. */
+function toSelectRequestOptions(options: ExtensionUISelectItem[]): { options: string[]; optionDetails?: ExtensionUiSelectOptionDetail[] } {
+  const labels = options.map(getExtensionUISelectOptionLabel);
+  const descriptions = options.map((option) => typeof option === "string" ? undefined : option.description?.trim());
+  if (!descriptions.some(Boolean)) return { options: labels };
+  return { options: labels, optionDetails: descriptions.map((description) => description ? { description } : {}) };
+}
+
 type ExtensionBindingOptions = {
   forceEmptySystemPrompt?: boolean;
 };
@@ -144,7 +161,6 @@ type ExtensionBindingOptions = {
 const RUNNING_STATE_EVENT_TYPES = new Set([
   "agent_start",
   "agent_end",
-  "agent_settled",
   "auto_compaction_start",
   "auto_compaction_end",
   "compaction_start",
@@ -153,7 +169,6 @@ const RUNNING_STATE_EVENT_TYPES = new Set([
 
 const IDLE_RESET_EVENT_TYPES = new Set([
   "agent_end",
-  "agent_settled",
   "auto_compaction_end",
   "compaction_end",
 ]);
@@ -162,6 +177,7 @@ const MAX_SUBAGENT_HISTORY = 128;
 
 const HANDOFF_ALLOWED_COMMAND_TYPES: Record<string, true> = {
   abort: true,
+  abort_compaction: true,
   extension_ui_input: true,
   extension_ui_response: true,
   get_commands: true,
@@ -206,7 +222,7 @@ class PlainTextTheme extends Theme {
   constructor() {
     super(
       { thinkingXhigh: "" } as ConstructorParameters<typeof Theme>[0],
-      {} as ConstructorParameters<typeof Theme>[1],
+      { statusLineBg: "" } as ConstructorParameters<typeof Theme>[1],
       "truecolor",
       "unicode",
       {},
@@ -400,6 +416,8 @@ export class AgentSessionWrapper {
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
+  // Pictures of open form dialogs, by the token their request carries.
+  private formMedia = new Map<string, FormMediaSource[]>();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
   private activeExtensionWidgets = new Map<string, ActiveExtensionWidget>();
@@ -412,7 +430,7 @@ export class AgentSessionWrapper {
   // The tail of the prompt-admission queue: each prompt waits for the
   // preceding one's preflight to pass or fail before entering the SDK.
   private promptAdmissionTail: Promise<void> = Promise.resolve();
-  // An accepted run awaits its agent_settled before completion is announced.
+  // An accepted run announces completion once its terminal end and prompt are idle.
   private agentRunNeedsCompletion = false;
   // The last settled run was stopped, not finished: nothing to announce.
   private lastRunAborted = false;
@@ -639,13 +657,22 @@ export class AgentSessionWrapper {
     this.unsubscribe = this.inner.subscribe((sessionEvent) => {
       // SDK event members are closed interfaces; the browser stream treats them
       // as open records (omp 18.10's cache_warming_* events made that explicit).
-      const event = sessionEvent as unknown as AgentEvent;
+      // Since omp 18.21 the session reports a loop that stops inside a run as
+      // `agent_pause`; `toWireEvent` folds it back into the per-loop `agent_end`
+      // with `isTerminal: false` that `omp --mode rpc` sends and this host reads.
+      let event = toWireEvent(sessionEvent) as unknown as AgentEvent;
       if (event.type === "agent_start") {
         this.agentRunNeedsCompletion = true;
         this.lastRunAborted = false;
       }
-      if (event.type === "agent_settled") this.lastRunAborted = event.aborted === true;
       if (event.type === "agent_end") {
+        if (event.isTerminal !== false) {
+          const lastAssistant = Array.isArray(event.messages)
+            ? event.messages.findLast((message) => message.role === "assistant")
+            : undefined;
+          this.lastRunAborted = event.aborted === true || lastAssistant?.stopReason === "aborted";
+          if (this.lastRunAborted) event = { ...event, aborted: true };
+        }
         invalidateSessionListCache();
         // Every tool call of the run has finished; nothing is left to replay.
         this.activeToolEvents.clear();
@@ -653,7 +680,7 @@ export class AgentSessionWrapper {
       this.trackActiveToolEvent(event);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
-      if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
+      if (event.type === "agent_end" && event.isTerminal !== false) this.notifyAgentRunCompleteIfIdle();
       if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
       void this.goalMode.handleSessionEvent(event).catch((error) => {
         console.error(
@@ -1499,11 +1526,8 @@ export class AgentSessionWrapper {
       }
 
       case "handoff": {
-        // omp 18 made handoff in-place: it summarizes the conversation into a
-        // handoff document and commits that as this session's compaction entry
-        // instead of minting a replacement session. It still rewrites history
-        // behind a oneshot model call, so it must not run while a prompt is
-        // streaming or any other work owns the session.
+        // Keep the browser's blocking handoff contract while the SDK prepares
+        // and commits the summary through background compaction.
         if (this.handoffRunning || this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
           throw new Error("Cannot hand off while the session is busy");
         }
@@ -1511,13 +1535,14 @@ export class AgentSessionWrapper {
         this.handoffRunning = true;
         notifyRunningChange();
         try {
-          // No result means the handoff was cancelled; the session is untouched.
-          const result = await this.inner.handoff(customInstructions);
-          if (!result) return { cancelled: true };
+          await this.inner.compact(customInstructions, { mode: "handoff" });
           // The session id and file are unchanged, so only the cached listing
           // (modified time, token counts) has gone stale.
           invalidateSessionListCache();
           return { cancelled: false };
+        } catch (error) {
+          if (error instanceof CompactionCancelledError) return { cancelled: true };
+          throw error;
         } finally {
           this.handoffRunning = false;
           notifyRunningChange();
@@ -1613,10 +1638,12 @@ export class AgentSessionWrapper {
 
       case "get_tools": {
         const active = new Set<string>(this.inner.getActiveToolNames());
+        const enabled = new Set<string>(this.inner.getEnabledToolNames());
         return listTools(this.inner).map((t) => ({
           name: t.name,
           description: t.description,
-          active: active.has(t.name),
+          active: enabled.has(t.name),
+          ...(enabled.has(t.name) && !active.has(t.name) ? { declarationHidden: true } : {}),
         }));
       }
 
@@ -1892,6 +1919,12 @@ export class AgentSessionWrapper {
     const pending = this.pendingUiResponses.get(response.id);
     if (!pending) return;
     pending.resolve(response);
+  }
+
+  /** A picture of an open form dialog, or null once the form is answered or the picture is unknown. */
+  async loadFormMedia(token: string, index: number, signal?: AbortSignal) {
+    const source = this.formMedia.get(token)?.[index];
+    return source ? loadFormMedia(source, this.cwd, signal) : null;
   }
 
   private getExtensionStatuses(): Array<{ key: string; text: string }> {
@@ -2332,6 +2365,8 @@ export class AgentSessionWrapper {
     parseResponse: (response: ExtensionUiResponse) => T,
     timeout?: number,
     signal?: AbortSignal,
+    // What stands in once `timeout` plus `graceMs` has passed, instead of `defaultValue`.
+    timeoutFallback?: { graceMs: number; value: T },
   ): Promise<T> {
     if (signal?.aborted) return Promise.resolve(defaultValue);
     const stopSignal = this.extensionUiAbortController.signal;
@@ -2365,7 +2400,12 @@ export class AgentSessionWrapper {
     };
     const onAbort = () => settle(defaultValue);
 
-    if (timeout) timeoutId = setTimeout(() => settle(defaultValue), timeout);
+    if (timeout) {
+      timeoutId = setTimeout(
+        () => settle(timeoutFallback ? timeoutFallback.value : defaultValue),
+        timeout + (timeoutFallback?.graceMs ?? 0),
+      );
+    }
     abortSignal.addEventListener("abort", onAbort, { once: true });
 
     this.pendingUiRequests.set(id, fullRequest as AgentEvent);
@@ -2394,8 +2434,39 @@ export class AgentSessionWrapper {
         opts?.timeout,
         opts?.signal,
       ),
+      formDialog: async (html, opts) => {
+        const { form, client, media } = prepareFormDialog(html);
+        const mediaToken = media.length > 0 ? randomUUID() : undefined;
+        if (mediaToken) this.formMedia.set(mediaToken, media);
+        try {
+          return await this.requestExtensionUi<FormDialogAnswer | undefined>(
+            {
+              method: "form",
+              form: client,
+              ...(mediaToken
+                ? { mediaPath: `/api/agent/${encodeURIComponent(this.runtimeId)}/form-media/${mediaToken}` }
+                : {}),
+            },
+            undefined,
+            (response) => {
+              if (!("value" in response)) return undefined;
+              const state = parseFormDialogState(response.value);
+              if (!state) return undefined;
+              return { data: formDataFromState(form, state), ...(state.timedOut ? { timedOut: true } : {}) };
+            },
+            opts?.timeout,
+            opts?.signal,
+            {
+              graceMs: FORM_TIMEOUT_GRACE_MS,
+              value: { data: formDataFromState(form, { choices: {}, texts: {} }), timedOut: true },
+            },
+          );
+        } finally {
+          if (mediaToken) this.formMedia.delete(mediaToken);
+        }
+      },
       select: (title, options, opts) => this.requestExtensionUi(
-        { method: "select", title, options, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        { method: "select", title, ...toSelectRequestOptions(options), ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
         undefined,
         (response) => "value" in response ? response.value : undefined,
         opts?.timeout,
